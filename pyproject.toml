@@ -10,7 +10,8 @@ python = "^3.11"
 duckdb = "*"
 reflex = "0.8.24.post1"
 pandas = "*"
-idc-index = "*"
+idc-index = ">=0.6.0"
+idc-index-data = "*"
 requests = "*"
 
 [build-system]
