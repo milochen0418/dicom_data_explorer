@@ -1,5 +1,6 @@
 duckdb
-reflex==0.8.24.post1
+reflex==0.10.0
 pandas
 idc-index
+idc-index-data
 requests

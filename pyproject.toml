@@ -6,9 +6,11 @@ readme = "README.md"
 packages = [{ include = "dicom_data_explorer" }]
 
 [tool.poetry.dependencies]
-python = "^3.11"
+# 3.11 floor: Reflex 0.10 and the re_ddns smart-launcher image (python:3.11).
+# <3.15 cap: duckdb (1.5.6) has no CPython 3.15 wheels yet.
+python = ">=3.11,<3.15"
 duckdb = "*"
-reflex = "0.8.24.post1"
+reflex = "0.10.0"
 pandas = "*"
 idc-index = ">=0.6.0"
 idc-index-data = "*"
