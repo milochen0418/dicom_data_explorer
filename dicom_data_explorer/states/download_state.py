@@ -2,26 +2,12 @@ import reflex as rx
 from datetime import datetime
 import asyncio
 import logging
-import os
 from pathlib import Path
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 import requests
-
-
-DOWNLOAD_ROOT = Path(os.getenv("PUBLIC_DICOM_DIR", "/Users/Shared/DICOM"))
-
-
-def _sanitize_segment(value: str) -> str:
-    if not value:
-        return "unknown"
-    safe = str(value).strip().replace("/", "_").replace("\\", "_")
-    return safe or "unknown"
-
-
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+from reflex_ddns_auth.collections import Collection
 
 
 def _download_stream(url: str, dest_path: Path) -> None:
@@ -176,6 +162,8 @@ class DownloadState(rx.State):
         self.progress_message = "Downloading..."
         yield
         completed_items: list[dict] = []
+        # Each series becomes one item of the shared "dicom" collection.
+        dicom = Collection("dicom")
         for item in self.cart_items:
             try:
                 source = item.get("source", "").upper()
@@ -185,10 +173,6 @@ class DownloadState(rx.State):
                     yield
                     continue
                 series_aws_url = item.get("series_aws_url", "")
-                collection = _sanitize_segment(item.get("Collection", ""))
-                series_dir = DOWNLOAD_ROOT / collection / _sanitize_segment(
-                    self.current_series_uid
-                )
                 plan = idc_plan.get(self.current_series_uid)
                 if not plan:
                     bucket, prefix, keys = await asyncio.to_thread(
@@ -196,27 +180,39 @@ class DownloadState(rx.State):
                     )
                     plan = {"bucket": bucket, "prefix": prefix, "keys": keys}
                 prefix_path = Path(plan["prefix"])
-                _ensure_dir(series_dir)
-                for key in plan["keys"]:
-                    key_path = Path(key)
-                    if plan["prefix"] and key.startswith(plan["prefix"]):
-                        rel_path = key_path.relative_to(prefix_path)
-                    else:
-                        rel_path = Path(key_path.name)
-                    dest_path = series_dir / rel_path
-                    if not dest_path.exists():
-                        url = f"https://{plan['bucket']}.s3.amazonaws.com/{key}"
-                        await asyncio.to_thread(_download_stream, url, dest_path)
-                    self.downloaded_files += 1
-                    if self.total_files > 0:
-                        self.download_progress = int(
-                            self.downloaded_files / self.total_files * 100
-                        )
-                    yield
+                if dicom.has(self.current_series_uid):
+                    self.downloaded_files += len(plan["keys"])  # already in the collection
+                else:
+                    # Files are written in a staging folder; the series shows up
+                    # for other apps only when this block completes.
+                    with dicom.publish(
+                        self.current_series_uid,
+                        kind="dicom.series",
+                        title=" · ".join(str(item[k]) for k in ("Collection", "Modality") if item.get(k)),
+                        source=series_aws_url,
+                        meta={k: item[k] for k in ("Collection", "Modality", "BodyPartExamined", "ImageCount") if item.get(k)},
+                    ) as series:
+                        for key in plan["keys"]:
+                            key_path = Path(key)
+                            if plan["prefix"] and key.startswith(plan["prefix"]):
+                                rel_path = key_path.relative_to(prefix_path)
+                            else:
+                                rel_path = Path(key_path.name)
+                            dest_path = series.path / rel_path
+                            if not dest_path.exists():
+                                url = f"https://{plan['bucket']}.s3.amazonaws.com/{key}"
+                                await asyncio.to_thread(_download_stream, url, dest_path)
+                            self.downloaded_files += 1
+                            if self.total_files > 0:
+                                self.download_progress = int(
+                                    self.downloaded_files / self.total_files * 100
+                                )
+                            yield
                 history_item = item.copy()
                 history_item["downloaded_at"] = datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
+                history_item["ref"] = dicom.ref(self.current_series_uid)
                 completed_items.append(history_item)
             except Exception as e:
                 logging.exception("Download failed for %s: %s", item, e)
