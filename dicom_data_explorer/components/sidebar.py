@@ -3,95 +3,94 @@ from dicom_data_explorer.states.ui_state import UIState
 from dicom_data_explorer.states.download_state import DownloadState
 
 
-def sidebar_item(text: str, icon: str, href: str) -> rx.Component:
+def sidebar_item(text: str, icon: str, href: str, active, badge: rx.Component | None = None) -> rx.Component:
     return rx.el.a(
-        rx.el.div(
-            rx.icon(
-                icon,
-                size=20,
-                class_name="text-gray-500 group-hover:text-blue-600 transition-colors",
-            ),
-            rx.el.span(text, class_name="font-medium"),
-            class_name="flex items-center gap-3 px-4 py-3 rounded-xl hover:bg-blue-50 group transition-all duration-200",
-        ),
+        rx.icon(icon, size=20),
+        rx.el.span(text, class_name="font-medium flex-1"),
+        badge,
         href=href,
-        class_name="w-full text-gray-700 block mb-1",
+        class_name=rx.cond(
+            active,
+            "flex items-center gap-3 px-4 py-2.5 rounded-xl bg-blue-50 text-blue-700 mb-1",
+            "flex items-center gap-3 px-4 py-2.5 rounded-xl text-gray-700 hover:bg-gray-100 mb-1",
+        ),
+    )
+
+
+def downloads_badge() -> rx.Component:
+    return rx.fragment(
+        rx.cond(
+            DownloadState.active_count > 0,
+            rx.el.span(
+                DownloadState.active_count,
+                title="Downloading or waiting",
+                class_name="bg-blue-600 text-white text-xs font-bold min-w-5 h-5 px-1.5 rounded-full flex items-center justify-center",
+            ),
+        ),
+        rx.cond(
+            DownloadState.problem_count > 0,
+            rx.el.span(
+                DownloadState.problem_count,
+                title="Failed or interrupted: open Downloads to retry",
+                class_name="bg-red-500 text-white text-xs font-bold min-w-5 h-5 px-1.5 rounded-full flex items-center justify-center ml-1",
+            ),
+        ),
+    )
+
+
+def current_download() -> rx.Component:
+    """What is downloading right now, visible from every page."""
+    job = DownloadState.current
+    return rx.cond(
+        job.uid != "",
+        rx.el.a(
+            rx.el.div(
+                rx.icon("loader-circle", size=14, class_name="animate-spin text-blue-600"),
+                rx.el.span("Downloading", class_name="text-xs font-semibold text-blue-700"),
+                rx.el.span(
+                    rx.cond(DownloadState.active_count > 1, f"+{DownloadState.active_count - 1} waiting", ""),
+                    class_name="text-xs text-gray-500 ml-auto",
+                ),
+                class_name="flex items-center gap-1.5 mb-1",
+            ),
+            rx.el.p(job.title, class_name="text-sm text-gray-800 truncate"),
+            rx.el.div(
+                rx.el.div(
+                    class_name="h-full bg-blue-600 rounded-full transition-all duration-500",
+                    style={"width": f"{job.percent}%"},
+                ),
+                class_name="w-full h-1.5 bg-blue-100 rounded-full overflow-hidden mt-2",
+            ),
+            rx.el.p(f"{job.percent}%", class_name="text-xs text-gray-500 mt-1"),
+            href="/downloads",
+            class_name="block mx-4 mb-4 p-3 rounded-xl border border-blue-100 bg-white hover:border-blue-300",
+        ),
     )
 
 
 def sidebar() -> rx.Component:
+    path = rx.State.router.page.path
     return rx.el.aside(
         rx.el.div(
-            rx.el.div(
-                rx.icon("activity", class_name="text-blue-600", size=28),
-                rx.el.span(
-                    "DICOM Explorer", class_name="text-xl font-bold text-gray-900"
-                ),
-                class_name="flex items-center gap-3",
-            ),
-            class_name="h-16 flex items-center px-6 border-b border-gray-100",
+            rx.icon("activity", class_name="text-blue-600", size=26),
+            rx.el.span("DICOM Explorer", class_name="text-lg font-bold text-gray-900"),
+            class_name="h-16 flex items-center gap-3 px-6 border-b border-gray-100",
         ),
         rx.el.nav(
-            rx.el.div(
-                rx.el.p(
-                    "MENU",
-                    class_name="text-xs font-bold text-gray-400 px-4 mb-2 tracking-wider",
-                ),
-                sidebar_item("Welcome", "layout-dashboard", "/"),
-                sidebar_item("IDC Search", "cloud-drizzle", "/idc-search"),
-                rx.el.div(
-                    sidebar_item("Downloads", "download", "/downloads"),
-                    rx.cond(
-                        DownloadState.cart_count > 0,
-                        rx.el.div(
-                            DownloadState.cart_count,
-                            class_name="absolute right-6 top-3 bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full",
-                        ),
-                        None,
-                    ),
-                    class_name="relative",
-                ),
-                class_name="py-6",
-            ),
-            rx.el.div(
-                rx.el.p(
-                    "SUPPORT",
-                    class_name="text-xs font-bold text-gray-400 px-4 mb-2 tracking-wider",
-                ),
-                rx.el.button(
-                    rx.el.div(
-                        rx.icon(
-                            "graduation-cap",
-                            size=20,
-                            class_name="text-gray-500 group-hover:text-blue-600 transition-colors",
-                        ),
-                        rx.el.span("Show Tutorial", class_name="font-medium"),
-                        class_name="flex items-center gap-3 px-4 py-3 rounded-xl hover:bg-blue-50 group transition-all duration-200 w-full",
-                    ),
-                    on_click=UIState.open_onboarding,
-                    class_name="w-full text-left text-gray-700 block mb-1",
-                ),
-                sidebar_item("Help & FAQ", "circle-help", "/help"),
-                class_name="py-2 border-t border-gray-100",
-            ),
-            class_name="flex-1 overflow-y-auto px-4",
+            sidebar_item("Find series", "search", "/", path != "/downloads"),
+            sidebar_item("Downloads", "download", "/downloads", path == "/downloads", downloads_badge()),
+            class_name="px-3 py-5",
         ),
+        rx.el.div(class_name="flex-1"),
+        current_download(),
         rx.el.div(
-            rx.el.div(
-                rx.el.div(
-                    rx.el.span("GU", class_name="text-sm font-bold text-blue-600"),
-                    class_name="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center",
-                ),
-                rx.el.div(
-                    rx.el.p(
-                        "Guest User", class_name="text-sm font-medium text-gray-900"
-                    ),
-                    rx.el.p("Ready to explore", class_name="text-xs text-gray-500"),
-                    class_name="flex flex-col",
-                ),
-                class_name="flex items-center gap-3",
+            rx.el.button(
+                rx.icon("graduation-cap", size=20),
+                rx.el.span("DICOM basics", class_name="font-medium"),
+                on_click=UIState.open_onboarding,
+                class_name="w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-gray-700 hover:bg-gray-100",
             ),
-            class_name="p-4 border-t border-gray-100",
+            class_name="px-3 py-3 border-t border-gray-100",
         ),
-        class_name="w-64 h-full bg-white border-r border-gray-200 flex flex-col shrink-0",
+        class_name="w-60 h-full bg-white border-r border-gray-200 flex flex-col shrink-0",
     )

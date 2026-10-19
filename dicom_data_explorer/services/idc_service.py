@@ -1,72 +1,188 @@
+"""Queries over the IDC series index: one row per series, about a million rows.
+
+Everything runs in DuckDB directly on the parquet file shipped with
+``idc-index-data``.  The dropdown counts and the match total come from the
+(collection, modality, body part) combinations — about a thousand rows —
+grouped once per search text and cached, so changing a dropdown only costs
+the query for the visible page.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import functools
+import threading
+from collections import Counter
+
 import duckdb
-import logging
-import idc_index_data as idc_data
+import idc_index_data
 
-PARQUET_PATH = str(idc_data.IDC_INDEX_PARQUET_FILEPATH)
+PARQUET_PATH = str(idc_index_data.IDC_INDEX_PARQUET_FILEPATH)
 
+SORTS = {
+    "newest": "SeriesDate DESC NULLS LAST",
+    "oldest": "SeriesDate ASC NULLS LAST",
+    "smallest": "series_size_MB ASC NULLS LAST",
+    "largest": "series_size_MB DESC NULLS LAST",
+    "most_images": "instanceCount DESC NULLS LAST",
+    "collection": "collection_id ASC, SeriesDate DESC NULLS LAST",
+}
+DEFAULT_SORT = "newest"
 
-def get_db_connection():
-    return duckdb.connect()
+# Free text matches any of these columns, case-insensitively.
+_TEXT_MATCH = (
+    "contains(lower(concat_ws(' ', SeriesDescription, collection_id, "
+    "StudyDescription, PatientID, SeriesInstanceUID)), ?)"
+)
 
+_ROW_COLUMNS = (
+    "SeriesInstanceUID, StudyInstanceUID, collection_id, PatientID, PatientSex, "
+    "PatientAge, Modality, BodyPartExamined, SeriesDate, SeriesDescription, "
+    "StudyDescription, Manufacturer, instanceCount, series_size_MB, "
+    "series_aws_url, license_short_name, source_DOI"
+)
 
-def fetch_collections() -> list[dict]:
-    try:
-        conn = get_db_connection()
-        query = f"\n            SELECT DISTINCT collection_id\n            FROM '{PARQUET_PATH}'\n            WHERE collection_id IS NOT NULL\n            ORDER BY collection_id\n        "
-        df = conn.execute(query).fetchdf()
-        return [{"Collection": row["collection_id"]} for _, row in df.iterrows()]
-    except Exception as e:
-        logging.exception(f"Error fetching IDC collections: {e}")
-        return []
-
-
-def fetch_modalities(collection: str = "") -> list[dict]:
-    try:
-        conn = get_db_connection()
-        where_clause = "WHERE Modality IS NOT NULL"
-        if collection:
-            where_clause += f" AND collection_id = '{collection}'"
-        query = f"\n            SELECT DISTINCT Modality\n            FROM '{PARQUET_PATH}'\n            {where_clause}\n            ORDER BY Modality\n        "
-        df = conn.execute(query).fetchdf()
-        return [{"Modality": row["Modality"]} for _, row in df.iterrows()]
-    except Exception as e:
-        logging.exception(f"Error fetching IDC modalities: {e}")
-        return []
+_conn: duckdb.DuckDBPyConnection | None = None
+_lock = threading.Lock()
 
 
-def fetch_body_parts(collection: str = "") -> list[dict]:
-    try:
-        conn = get_db_connection()
-        where_clause = "WHERE BodyPartExamined IS NOT NULL"
-        if collection:
-            where_clause += f" AND collection_id = '{collection}'"
-        query = f"\n            SELECT DISTINCT BodyPartExamined\n            FROM '{PARQUET_PATH}'\n            {where_clause}\n            ORDER BY BodyPartExamined\n        "
-        df = conn.execute(query).fetchdf()
-        return [
-            {"BodyPartExamined": row["BodyPartExamined"]} for _, row in df.iterrows()
-        ]
-    except Exception as e:
-        logging.exception(f"Error fetching IDC body parts: {e}")
-        return []
+def _query(sql: str, params: list | tuple = ()) -> list[dict]:
+    global _conn
+    with _lock:
+        if _conn is None:
+            _conn = duckdb.connect()
+            _conn.execute(
+                f"CREATE VIEW series AS SELECT * FROM read_parquet('{PARQUET_PATH}')"
+            )
+        cursor = _conn.execute(sql, list(params))
+        names = [d[0] for d in cursor.description]
+        return [dict(zip(names, row)) for row in cursor.fetchall()]
 
 
-def fetch_series(
-    collection: str = "", modality: str = "", body_part: str = "", limit: int = 1000
-) -> list[dict]:
-    try:
-        conn = get_db_connection()
-        conditions = ["1=1"]
-        if collection:
-            conditions.append(f"collection_id = '{collection}'")
-        if modality:
-            conditions.append(f"Modality = '{modality}'")
-        if body_part:
-            conditions.append(f"BodyPartExamined = '{body_part}'")
-        where_clause = " AND ".join(conditions)
-        query = f"\n            SELECT \n                SeriesInstanceUID,\n                collection_id as Collection,\n                Modality,\n                BodyPartExamined,\n                SeriesDate,\n                SeriesDescription,\n                instanceCount as ImageCount,\n                series_size_MB,\n                series_aws_url\n            FROM '{PARQUET_PATH}'\n            WHERE {where_clause}\n            LIMIT {limit}\n        "
-        df = conn.execute(query).fetchdf()
-        df = df.fillna("")
-        return df.to_dict(orient="records")
-    except Exception as e:
-        logging.exception(f"Error fetching IDC series: {e}")
-        return []
+@dataclasses.dataclass(frozen=True)
+class Filters:
+    collection: str = ""
+    modality: str = ""
+    body_part: str = ""
+    text: str = ""
+
+    @property
+    def needle(self) -> str:
+        return " ".join(self.text.lower().split())
+
+    def where(self) -> tuple[str, list]:
+        conditions, params = ["TRUE"], []
+        for column, value in (
+            ("collection_id", self.collection),
+            ("Modality", self.modality),
+            ("BodyPartExamined", self.body_part),
+        ):
+            if value:
+                conditions.append(f"{column} = ?")
+                params.append(value)
+        if self.needle:
+            conditions.append(_TEXT_MATCH)
+            params.append(self.needle)
+        return " AND ".join(conditions), params
+
+
+@dataclasses.dataclass(frozen=True)
+class Combo:
+    collection: str
+    modality: str
+    body_part: str
+    count: int
+    size_mb: float
+
+
+@functools.lru_cache(maxsize=64)
+def _combos(needle: str) -> tuple[Combo, ...]:
+    where, params = Filters(text=needle).where()
+    rows = _query(
+        "SELECT collection_id, Modality, BodyPartExamined, count(*) AS n, "
+        f"sum(series_size_MB) AS mb FROM series WHERE {where} GROUP BY ALL",
+        params,
+    )
+    return tuple(
+        Combo(
+            collection=r["collection_id"] or "",
+            modality=r["Modality"] or "",
+            body_part=r["BodyPartExamined"] or "",
+            count=int(r["n"]),
+            size_mb=float(r["mb"] or 0),
+        )
+        for r in rows
+    )
+
+
+@dataclasses.dataclass
+class Summary:
+    total: int
+    size_mb: float
+    # Each dropdown's choices with how many series they would give, counted
+    # with the *other* filters applied (so a choice never leads to nothing).
+    collections: list[tuple[str, int]]
+    modalities: list[tuple[str, int]]
+    body_parts: list[tuple[str, int]]
+
+
+def summarize(f: Filters) -> Summary:
+    combos = _combos(f.needle)
+    wanted = {"collection": f.collection, "modality": f.modality, "body_part": f.body_part}
+
+    def keep(c: Combo, ignore: str | None) -> bool:
+        return all(
+            not value or dim == ignore or getattr(c, dim) == value
+            for dim, value in wanted.items()
+        )
+
+    facets: dict[str, Counter] = {dim: Counter() for dim in wanted}
+    total, size_mb = 0, 0.0
+    for c in combos:
+        for dim in wanted:
+            if getattr(c, dim) and keep(c, dim):
+                facets[dim][getattr(c, dim)] += c.count
+        if keep(c, None):
+            total += c.count
+            size_mb += c.size_mb
+    return Summary(
+        total=total,
+        size_mb=size_mb,
+        collections=sorted(facets["collection"].items()),
+        modalities=sorted(facets["modality"].items()),
+        body_parts=sorted(facets["body_part"].items()),
+    )
+
+
+def search(f: Filters, sort: str = DEFAULT_SORT, limit: int = 25, offset: int = 0) -> list[dict]:
+    where, params = f.where()
+    order = SORTS.get(sort, SORTS[DEFAULT_SORT])
+    return _query(
+        f"SELECT {_ROW_COLUMNS} FROM series WHERE {where} "
+        f"ORDER BY {order}, SeriesInstanceUID LIMIT ? OFFSET ?",
+        [*params, int(limit), int(offset)],
+    )
+
+
+def series_by_uid(uids: list[str]) -> dict[str, dict]:
+    if not uids:
+        return {}
+    marks = ", ".join("?" for _ in uids)
+    rows = _query(
+        f"SELECT {_ROW_COLUMNS} FROM series WHERE SeriesInstanceUID IN ({marks})",
+        list(uids),
+    )
+    return {r["SeriesInstanceUID"]: r for r in rows}
+
+
+def viewer_url(study_uid: str, series_uid: str, modality: str) -> str:
+    """IDC's own web viewer for one series (Slim for slides, OHIF otherwise)."""
+    if not study_uid or not series_uid:
+        return ""
+    base = "https://viewer.imaging.datacommons.cancer.gov"
+    if modality == "SM":
+        return f"{base}/slim/studies/{study_uid}/series/{series_uid}"
+    return (
+        f"{base}/v3/viewer/?StudyInstanceUIDs={study_uid}"
+        f"&initialSeriesInstanceUID={series_uid}"
+    )

@@ -52,7 +52,7 @@ def onboarding_modal() -> rx.Component:
                         rx.cond(
                             UIState.current_onboarding_step
                             == UIState.onboarding_steps.length() - 1,
-                            "Get Started",
+                            "Got it",
                             "Next",
                         ),
                         on_click=UIState.next_onboarding_step,

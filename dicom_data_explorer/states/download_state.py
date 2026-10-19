@@ -1,228 +1,287 @@
-import reflex as rx
-from datetime import datetime
+"""Each tab's view of the shared download queue and of the downloaded series."""
+
+from __future__ import annotations
+
 import asyncio
-import logging
-from pathlib import Path
-import xml.etree.ElementTree as ET
-from urllib.parse import urlparse
+import dataclasses
 
-import requests
-from reflex_ddns_auth.collections import Collection
+import reflex as rx
 
+from dicom_data_explorer import formatting
+from dicom_data_explorer.services import downloader, idc_service
+from dicom_data_explorer.services.downloader import Series
 
-def _download_stream(url: str, dest_path: Path) -> None:
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, stream=True, timeout=(10, 120)) as response:
-        response.raise_for_status()
-        with open(dest_path, "wb") as handle:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    handle.write(chunk)
+# Ask before downloading a series bigger than this (MB).
+BIG_DOWNLOAD_MB = 1000
+POLL_SECONDS = 0.5
 
 
-def _normalize_s3_prefix(prefix: str) -> str:
-    cleaned = prefix.replace("*", "")
-    return cleaned
+@dataclasses.dataclass
+class JobCard:
+    uid: str = ""
+    title: str = ""
+    subtitle: str = ""
+    status: str = ""
+    percent: int = 0
+    progress: str = ""  # "34 of 50 files · 18 of 26 MB"
+    rate: str = ""  # "3.4 MB/s · about 3 s left"
+    note: str = ""
 
 
-def _parse_s3_url(series_aws_url: str) -> tuple[str, str]:
-    if not series_aws_url:
-        raise ValueError("Missing series_aws_url for IDC download")
-    parsed = urlparse(series_aws_url)
-    if parsed.scheme == "s3":
-        bucket = parsed.netloc
-        prefix = _normalize_s3_prefix(parsed.path.lstrip("/"))
-        return bucket, prefix
-    if parsed.scheme in {"http", "https"}:
-        host = parsed.netloc
-        if host.endswith(".s3.amazonaws.com"):
-            bucket = host.split(".s3.amazonaws.com")[0]
-            prefix = _normalize_s3_prefix(parsed.path.lstrip("/"))
-            return bucket, prefix
-        if host == "s3.amazonaws.com":
-            path_parts = parsed.path.lstrip("/").split("/", 1)
-            bucket = path_parts[0]
-            prefix = _normalize_s3_prefix(path_parts[1] if len(path_parts) > 1 else "")
-            return bucket, prefix
-    raise ValueError(f"Unsupported series_aws_url format: {series_aws_url}")
+@dataclasses.dataclass
+class SavedSeries:
+    uid: str = ""
+    title: str = ""
+    subtitle: str = ""
+    size: str = ""
+    saved_at: str = ""
+    folder: str = ""
+    path: str = ""
 
 
-def _list_s3_objects(bucket: str, prefix: str) -> list[str]:
-    keys: list[str] = []
-    continuation: str | None = None
-    while True:
-        params = {"list-type": "2", "prefix": prefix}
-        if continuation:
-            params["continuation-token"] = continuation
-        response = requests.get(
-            f"https://{bucket}.s3.amazonaws.com",
-            params=params,
-            timeout=(10, 120),
+def _title(s: Series) -> str:
+    return s.description or f"Series …{s.uid[-12:]}"
+
+
+def _subtitle(s: Series) -> str:
+    parts = [s.collection, s.modality, s.body_part]
+    if s.images:
+        parts.append(f"{formatting.count(s.images)} images")
+    parts.append(formatting.size_mb(s.size_mb))
+    return " · ".join(p for p in parts if p)
+
+
+def _card(job: dict) -> JobCard:
+    s: Series = job["series"]
+    status = job["status"]
+    done, total = job["bytes_done"], job["bytes_total"]
+    percent = int(done * 100 / total) if total else 0
+    progress = rate = note = ""
+    if job["files_total"]:
+        progress = (
+            f"{formatting.count(job['files_done'])} of {formatting.count(job['files_total'])} files"
+            f" · {formatting.size_bytes(done) if done else '0 MB'} of {formatting.size_bytes(total)}"
         )
-        response.raise_for_status()
-        root = ET.fromstring(response.text)
-        for key_node in root.findall(".//{*}Contents/{*}Key"):
-            if key_node.text:
-                keys.append(key_node.text)
-        token_node = root.find(".//{*}NextContinuationToken")
-        if token_node is None or not token_node.text:
-            break
-        continuation = token_node.text
-    return keys
+    if status == downloader.RUNNING:
+        if not job["files_total"]:
+            note = "Asking IDC for the file list…"
+        elif job["speed"] > 0:
+            rate = formatting.speed(job["speed"])
+            if job["eta"] >= 0:
+                rate += f" · about {formatting.duration(job['eta'])} left"
+    elif status == downloader.QUEUED:
+        note = "Next" if job["position"] == 1 else f"Waiting · #{job['position']} in line"
+    elif status == downloader.CANCELING:
+        note = "Canceling…"
+    elif status == downloader.FAILED:
+        note = f"{job['error']} Retry continues where it stopped."
+    elif status == downloader.INTERRUPTED:
+        note = (
+            f"Stopped when the app restarted. {formatting.count(job['files_done'])} files "
+            "are kept; Resume fetches the rest."
+        )
+    return JobCard(
+        uid=s.uid, title=_title(s), subtitle=_subtitle(s), status=status,
+        percent=percent, progress=progress, rate=rate, note=note,
+    )
 
 
-def _get_idc_keys(series_aws_url: str) -> tuple[str, str, list[str]]:
-    bucket, prefix = _parse_s3_url(series_aws_url)
-    keys = [key for key in _list_s3_objects(bucket, prefix) if not key.endswith("/")]
-    if not keys:
-        raise ValueError(f"No objects found for IDC series at {series_aws_url}")
-    return bucket, prefix, keys
+def _load_saved(manager: downloader.DownloadManager) -> list[SavedSeries]:
+    items = manager.library()
+    # Series saved before descriptions went into the manifest: ask the index.
+    missing = [i.id for i in items if not i.meta.get("SeriesDescription")]
+    index = idc_service.series_by_uid(missing) if missing else {}
+    saved = []
+    for item in items:
+        m = item.meta
+        row = index.get(item.id)
+        s = Series.from_index(row) if row else Series(
+            uid=item.id, aws_url="",
+            collection=str(m.get("Collection") or ""), modality=str(m.get("Modality") or ""),
+            body_part=str(m.get("BodyPartExamined") or ""),
+            description=str(m.get("SeriesDescription") or ""),
+            images=int(m.get("ImageCount") or 0),
+        )
+        s.size_mb = item.bytes / 1e6
+        saved.append(
+            SavedSeries(
+                uid=item.id, title=_title(s), subtitle=_subtitle(s),
+                size=formatting.size_bytes(item.bytes), saved_at=item.created_at,
+                folder=f"{item.owner}/{item.id}", path=str(item.path),
+            )
+        )
+    return saved
 
 
 class DownloadState(rx.State):
-    cart_items: list[dict] = []
-    download_history: list[dict] = []
-    is_downloading: bool = False
-    download_progress: int = 0
-    total_files: int = 0
-    downloaded_files: int = 0
-    current_series_uid: str = ""
-    progress_message: str = ""
+    jobs: list[JobCard] = []
+    saved: list[SavedSeries] = []
+    # Per series UID, for the buttons in the search results.
+    status_of: dict[str, str] = {}
+    percent_of: dict[str, int] = {}
+
+    big_uid: str = ""
+    big_text: str = ""
+    delete_uid: str = ""
+    delete_title: str = ""
+
+    _version: int = -1
+    _seq: int = -1  # last finished download this tab has announced
+    _watching: bool = False
 
     @rx.var
-    def cart_count(self) -> int:
-        return len(self.cart_items)
+    def active_count(self) -> int:
+        return sum(1 for j in self.jobs if j.status in ("queued", "running", "canceling"))
 
     @rx.var
-    def total_size_mb(self) -> float:
-        total = 0.0
-        for item in self.cart_items:
-            size = item.get("series_size_MB")
-            if size:
-                try:
-                    total += float(size)
-                except (ValueError, TypeError) as e:
-                    logging.exception(f"Error calculating size for item: {e}")
-        return round(total, 2)
+    def problem_count(self) -> int:
+        return sum(1 for j in self.jobs if j.status in ("failed", "interrupted"))
 
-    @rx.event
-    def add_to_cart(self, series: dict, source: str):
-        for item in self.cart_items:
-            if item["SeriesInstanceUID"] == series["SeriesInstanceUID"]:
-                return
-        item = series.copy()
-        item["source"] = source
-        item["added_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.cart_items.append(item)
+    @rx.var
+    def current(self) -> JobCard:
+        for job in self.jobs:
+            if job.status in ("running", "canceling"):
+                return job
+        return JobCard()
 
-    @rx.event
-    def remove_from_cart(self, series_uid: str):
-        self.cart_items = [
-            item for item in self.cart_items if item["SeriesInstanceUID"] != series_uid
-        ]
+    @rx.var
+    def saved_total(self) -> str:
+        return f"{formatting.count(len(self.saved))} series"
 
-    @rx.event
-    def clear_cart(self):
-        self.cart_items = []
+    # -- syncing with the shared queue ----------------------------------------
 
-    @rx.event
-    async def start_download(self):
-        """Download selected series and store DICOM files locally."""
-        if not self.cart_items:
-            return
-        self.is_downloading = True
-        self.download_progress = 0
-        self.total_files = 0
-        self.downloaded_files = 0
-        self.current_series_uid = ""
-        self.progress_message = "Preparing download..."
-        idc_plan: dict[str, dict] = {}
-        yield
-        for item in self.cart_items:
-            source = item.get("source", "").upper()
-            if source == "IDC":
-                series_aws_url = item.get("series_aws_url", "")
-                try:
-                    bucket, prefix, keys = await asyncio.to_thread(
-                        _get_idc_keys, series_aws_url
-                    )
-                    idc_plan[item.get("SeriesInstanceUID", "")] = {
-                        "bucket": bucket,
-                        "prefix": prefix,
-                        "keys": keys,
-                    }
-                    self.total_files += len(keys)
-                except Exception as e:
-                    logging.exception("IDC listing failed for %s: %s", item, e)
-            else:
-                logging.warning("Unsupported source in cart: %s", source)
-            yield
-        if self.total_files == 0:
-            self.total_files = len(self.cart_items)
-        self.progress_message = "Downloading..."
-        yield
-        completed_items: list[dict] = []
-        # Each series becomes one item of the shared "dicom" collection.
-        dicom = Collection("dicom")
-        for item in self.cart_items:
-            try:
-                source = item.get("source", "").upper()
-                self.current_series_uid = item.get("SeriesInstanceUID", "")
-                if source != "IDC":
-                    logging.warning("Skipping unsupported source: %s", source)
-                    yield
+    def _apply(self, snap: dict, saved: list[SavedSeries] | None) -> list:
+        """Copy a queue snapshot (and maybe a fresh list of saved series) into the state."""
+        events = []
+        if saved is not None:
+            self.saved = saved
+        if snap["version"] != self._version or saved is not None:
+            self._version = snap["version"]
+            self.jobs = [_card(j) for j in snap["jobs"]]
+            status = {s.uid: "done" for s in self.saved}
+            status.update({j.uid: j.status for j in self.jobs})
+            self.status_of = status
+            self.percent_of = {j.uid: j.percent for j in self.jobs if j.status == "running"}
+        finished = snap["finished"]
+        newest = finished[-1]["seq"] if finished else 0
+        if self._seq >= 0:
+            for event in finished:
+                if event["seq"] <= self._seq:
                     continue
-                series_aws_url = item.get("series_aws_url", "")
-                plan = idc_plan.get(self.current_series_uid)
-                if not plan:
-                    bucket, prefix, keys = await asyncio.to_thread(
-                        _get_idc_keys, series_aws_url
-                    )
-                    plan = {"bucket": bucket, "prefix": prefix, "keys": keys}
-                prefix_path = Path(plan["prefix"])
-                if dicom.has(self.current_series_uid):
-                    self.downloaded_files += len(plan["keys"])  # already in the collection
-                else:
-                    # Files are written in a staging folder; the series shows up
-                    # for other apps only when this block completes.
-                    with dicom.publish(
-                        self.current_series_uid,
-                        kind="dicom.series",
-                        title=" · ".join(str(item[k]) for k in ("Collection", "Modality") if item.get(k)),
-                        source=series_aws_url,
-                        meta={k: item[k] for k in ("Collection", "Modality", "BodyPartExamined", "ImageCount") if item.get(k)},
-                    ) as series:
-                        for key in plan["keys"]:
-                            key_path = Path(key)
-                            if plan["prefix"] and key.startswith(plan["prefix"]):
-                                rel_path = key_path.relative_to(prefix_path)
-                            else:
-                                rel_path = Path(key_path.name)
-                            dest_path = series.path / rel_path
-                            if not dest_path.exists():
-                                url = f"https://{plan['bucket']}.s3.amazonaws.com/{key}"
-                                await asyncio.to_thread(_download_stream, url, dest_path)
-                            self.downloaded_files += 1
-                            if self.total_files > 0:
-                                self.download_progress = int(
-                                    self.downloaded_files / self.total_files * 100
-                                )
-                            yield
-                history_item = item.copy()
-                history_item["downloaded_at"] = datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-                history_item["ref"] = dicom.ref(self.current_series_uid)
-                completed_items.append(history_item)
-            except Exception as e:
-                logging.exception("Download failed for %s: %s", item, e)
-            yield
-        for history_item in reversed(completed_items):
-            self.download_history.insert(0, history_item)
-        self.cart_items = []
-        self.is_downloading = False
-        self.download_progress = 0
-        self.total_files = 0
-        self.downloaded_files = 0
-        self.current_series_uid = ""
-        self.progress_message = ""
+                name = _title(event["series"])
+                if event["outcome"] == "done":
+                    events.append(rx.toast.success(f"Downloaded: {name}"))
+                elif event["outcome"] == "failed":
+                    events.append(rx.toast.error(f"Download failed: {name}. {event['error']}"))
+        self._seq = newest
+        return events
+
+    def _start_watching(self, manager: downloader.DownloadManager):
+        if not self._watching and manager.busy():
+            self._watching = True
+            return DownloadState.watch
+        return None
+
+    @rx.event
+    async def sync(self):
+        """Page load: pick up downloads started elsewhere (other tabs, before a reload)."""
+        manager = await asyncio.to_thread(downloader.get_manager)
+        saved = await asyncio.to_thread(_load_saved, manager)
+        self._apply(manager.snapshot(), saved)
+        return self._start_watching(manager)
+
+    @rx.event(background=True)
+    async def watch(self):
+        manager = downloader.get_manager()
+        async with self:
+            seen = self._seq
+        while True:
+            busy = manager.busy()  # before the snapshot, so an idle one is final
+            snap = manager.snapshot()
+            newest = snap["finished"][-1]["seq"] if snap["finished"] else 0
+            saved = None
+            if newest != seen:
+                saved = await asyncio.to_thread(_load_saved, manager)
+            seen = newest
+            async with self:
+                events = self._apply(snap, saved)
+                # A download queued meanwhile found us still watching: keep going.
+                stop = not busy and not manager.busy()
+                if stop:
+                    self._watching = False
+            for event in events:
+                yield event
+            if stop:
+                return
+            await asyncio.sleep(POLL_SECONDS)
+
+    # -- actions ----------------------------------------------------------------
+
+    @rx.event
+    async def download(self, uid: str, confirmed: bool = False):
+        series = await asyncio.to_thread(downloader.lookup_series, uid)
+        if series is None:
+            return rx.toast.error("This series is not in the IDC index.")
+        if series.size_mb >= BIG_DOWNLOAD_MB and not confirmed:
+            self.big_uid = uid
+            self.big_text = (
+                f"“{_title(series)}” is {formatting.size_mb(series.size_mb)} "
+                f"({formatting.count(series.images)} images). It can take a long time "
+                "and needs that much free disk space."
+            )
+            return
+        self.big_uid = ""
+        manager = downloader.get_manager()
+        outcome = manager.add(series)
+        self._apply(manager.snapshot(), None)
+        if outcome == "downloaded":
+            saved = await asyncio.to_thread(_load_saved, manager)
+            self._apply(manager.snapshot(), saved)
+            return rx.toast.info("Already downloaded — see Downloads.")
+        return self._start_watching(manager)
+
+    @rx.event
+    def confirm_big(self):
+        return DownloadState.download(self.big_uid, True)
+
+    @rx.event
+    def cancel_big(self):
+        self.big_uid = ""
+
+    @rx.event
+    def cancel(self, uid: str):
+        manager = downloader.get_manager()
+        manager.cancel(uid)
+        self._apply(manager.snapshot(), None)
+        return self._start_watching(manager)
+
+    @rx.event
+    def retry(self, uid: str):
+        manager = downloader.get_manager()
+        manager.retry(uid)
+        self._apply(manager.snapshot(), None)
+        return self._start_watching(manager)
+
+    @rx.event
+    def ask_delete(self, uid: str, title: str):
+        self.delete_uid = uid
+        self.delete_title = title
+
+    @rx.event
+    def cancel_delete(self):
+        self.delete_uid = ""
+
+    @rx.event
+    async def confirm_delete(self):
+        uid, self.delete_uid = self.delete_uid, ""
+        manager = downloader.get_manager()
+        removed = await asyncio.to_thread(manager.delete, uid)
+        saved = await asyncio.to_thread(_load_saved, manager)
+        self._apply(manager.snapshot(), saved)
+        if not removed:
+            return rx.toast.error("Couldn't delete that series.")
+        return rx.toast.success("Deleted from the shared DICOM folder.")
+
+    @rx.event
+    def copy_path(self, path: str):
+        return [rx.set_clipboard(path), rx.toast.info("Folder path copied.")]
