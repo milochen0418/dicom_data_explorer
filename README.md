@@ -24,6 +24,21 @@ Review your cart and start downloads with progress feedback.
 
 ![Start Downloading](docs/images/start-downloading.png)
 
+### Fetching the images an annotation needs
+
+Other apps can open this app's `dicom.fetch-series` page as a dialog (a DDNS
+Intent). DICOM Viewer does so when a downloaded annotation object (SEG,
+RTSTRUCT, SR, PR) refers to series that are not downloaded yet: the dialog
+lists those series from the IDC index, downloads them with the usual queue
+(they appear under Downloads too) and, once every one of them is in, hands
+back to the viewer, which opens them with the annotation on top.
+
+| Intent | Params |
+|--------|--------|
+| `dicom.fetch-series` | `series`: comma-separated SeriesInstanceUIDs (required); `title`: how the caller names the annotation |
+
+The result is `{"series": [...], "downloaded": [...]}`.
+
 ## Design Document
 
 We’ve added a software design document to share the architecture and roadmap. Please reference it and join the open-source development efforts.
