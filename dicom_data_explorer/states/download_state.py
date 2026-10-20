@@ -39,6 +39,10 @@ class SavedSeries:
     folder: str = ""
     path: str = ""
     annotation: bool = False  # a SEG, RTSTRUCT, SR, ... that belongs to other images
+    # For an annotation: "present" when every series it refers to is downloaded,
+    # "missing" when some are not, "unknown" when its files cannot be read.
+    images: str = ""
+    needs: list[str] = dataclasses.field(default_factory=list)  # the series it refers to
 
 
 def _title(s: Series) -> str:
@@ -88,8 +92,61 @@ def _card(job: dict) -> JobCard:
     )
 
 
+# What each downloaded annotation refers to; its files never change once published.
+_references_cache: dict[str, set[str] | None] = {}
+
+
+def _images_state(item, collection) -> tuple[str, list[str]]:
+    """("present" | "missing" | "unknown", the series this annotation refers to)."""
+    if item.id not in _references_cache:
+        try:
+            _references_cache[item.id] = references.series_referenced_by(item.path, item.id)
+        except references.ReferencesUnavailable:
+            return "unknown", []
+    needed = sorted(_references_cache[item.id] or [])
+    if not needed:
+        return "unknown", []
+    return ("present" if all(collection.has(uid) for uid in needed) else "missing"), needed
+
+
+def _images_of(saved: list[SavedSeries], status: dict[str, str], percent: dict[str, int]) -> tuple[dict, dict, dict]:
+    """Per downloaded annotation: the live state of the images it refers to, from the queue.
+
+    Returns (state, percent, text) dicts by the annotation's uid. The state is
+    the static one ("present", "missing", "unknown") unless one of its series
+    is in the queue: then "queued", "running", "canceling" or "failed".
+    """
+    states: dict[str, str] = {}
+    percents: dict[str, int] = {}
+    texts: dict[str, str] = {}
+    for s in saved:
+        if not s.annotation:
+            continue
+        state, pct, text = s.images, 0, ""
+        if s.needs:
+            seen = [status.get(uid, "") for uid in s.needs]
+            if all(st == "done" for st in seen):
+                state, pct, text = "present", 100, "with its images"
+            elif "running" in seen:
+                pct = percent.get(s.needs[seen.index("running")], 0)
+                state, text = "running", f"Downloading images · {pct}%"
+            elif "canceling" in seen:
+                state, text = "canceling", "Canceling…"
+            elif "queued" in seen:
+                state, text = "queued", "Images waiting in the queue"
+            elif "failed" in seen or "interrupted" in seen:
+                state, text = "failed", "The image download stopped"
+            else:
+                state, text = "missing", ""
+        elif state == "present":
+            text = "with its images"
+        states[s.uid], percents[s.uid], texts[s.uid] = state, pct, text
+    return states, percents, texts
+
+
 def _load_saved(manager: downloader.DownloadManager) -> list[SavedSeries]:
     items = manager.library()
+    collection = manager.collection()
     # Series saved before descriptions went into the manifest: ask the index.
     missing = [i.id for i in items if not i.meta.get("SeriesDescription")]
     index = idc_service.series_by_uid(missing) if missing else {}
@@ -105,12 +162,14 @@ def _load_saved(manager: downloader.DownloadManager) -> list[SavedSeries]:
             images=int(m.get("ImageCount") or 0),
         )
         s.size_mb = item.bytes / 1e6
+        annotation = s.modality in references.ANNOTATION_MODALITIES
+        images, needs = _images_state(item, collection) if annotation else ("", [])
         saved.append(
             SavedSeries(
                 uid=item.id, title=_title(s), subtitle=_subtitle(s),
                 size=formatting.size_bytes(item.bytes), saved_at=item.created_at,
                 folder=f"{item.owner}/{item.id}", path=str(item.path),
-                annotation=s.modality in references.ANNOTATION_MODALITIES,
+                annotation=annotation, images=images, needs=needs,
             )
         )
     return saved
@@ -122,6 +181,10 @@ class DownloadState(rx.State):
     # Per series UID, for the buttons in the search results.
     status_of: dict[str, str] = {}
     percent_of: dict[str, int] = {}
+    # Per downloaded annotation, the live state of the images it refers to.
+    images_of: dict[str, str] = {}
+    images_percent_of: dict[str, int] = {}
+    images_text_of: dict[str, str] = {}
 
     big_uid: str = ""
     big_text: str = ""
@@ -201,6 +264,9 @@ class DownloadState(rx.State):
             status.update({j.uid: j.status for j in self.jobs})
             self.status_of = status
             self.percent_of = {j.uid: j.percent for j in self.jobs if j.status == "running"}
+            self.images_of, self.images_percent_of, self.images_text_of = _images_of(
+                list(self.saved), status, self.percent_of
+            )
         finished = snap["finished"]
         newest = finished[-1]["seq"] if finished else 0
         if self._seq >= 0:

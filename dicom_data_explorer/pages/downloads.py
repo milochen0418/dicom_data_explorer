@@ -147,8 +147,8 @@ def in_progress() -> rx.Component:
 def saved_row(item: SavedSeries) -> rx.Component:
     return rx.el.tr(
         rx.el.td(
-            rx.el.p(item.title, class_name="font-medium text-gray-900 truncate max-w-[24rem]"),
-            rx.el.p(item.subtitle, class_name="text-xs text-gray-500 truncate max-w-[24rem]"),
+            rx.el.p(item.title, class_name="font-medium text-gray-900 truncate max-w-[18rem]"),
+            rx.el.p(item.subtitle, class_name="text-xs text-gray-500 truncate max-w-[18rem]"),
             class_name="px-4 py-3",
         ),
         rx.el.td(item.size, class_name="px-4 py-3 text-sm text-gray-600 text-right whitespace-nowrap"),
@@ -163,21 +163,85 @@ def saved_row(item: SavedSeries) -> rx.Component:
                 rx.icon("copy", size=13, class_name="shrink-0 text-gray-400"),
                 on_click=DownloadState.copy_path(item.path),
                 title=item.path,
-                class_name="flex items-center gap-1.5 max-w-[16rem] text-xs font-mono text-gray-600 hover:text-blue-700",
+                class_name="flex items-center gap-1.5 max-w-[10rem] text-xs font-mono text-gray-600 hover:text-blue-700",
             ),
             class_name="px-4 py-3",
         ),
         rx.el.td(
             rx.el.div(
-                rx.cond(
-                    item.annotation,
-                    rx.el.button(
-                        rx.icon("images", size=15),
-                        "Get images",
-                        on_click=DownloadState.check_companions(item.uid, True),
-                        title="Download the images this annotation belongs to",
-                        class_name="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 whitespace-nowrap",
+                rx.match(
+                    DownloadState.images_of[item.uid],
+                    (
+                        "present",
+                        rx.el.span(
+                            rx.icon("circle-check", size=14),
+                            "with its images",
+                            title="Every series this annotation refers to is downloaded",
+                            class_name="inline-flex items-center gap-1 text-xs text-green-700 whitespace-nowrap",
+                        ),
                     ),
+                    (
+                        "running",
+                        rx.el.div(
+                            rx.el.div(
+                                rx.el.div(
+                                    class_name="h-full bg-blue-600 rounded-full transition-all duration-500",
+                                    style={"width": f"{DownloadState.images_percent_of[item.uid]}%"},
+                                ),
+                                class_name="w-20 h-1.5 bg-blue-100 rounded-full overflow-hidden",
+                            ),
+                            rx.el.span(
+                                f"{DownloadState.images_percent_of[item.uid]}%",
+                                class_name="text-xs font-semibold text-blue-700 w-9 text-right",
+                            ),
+                            title=DownloadState.images_text_of[item.uid],
+                            class_name="inline-flex items-center gap-2 whitespace-nowrap",
+                        ),
+                    ),
+                    (
+                        "queued",
+                        rx.el.span(
+                            rx.icon("clock", size=14),
+                            "Images waiting",
+                            title=DownloadState.images_text_of[item.uid],
+                            class_name="inline-flex items-center gap-1 text-xs text-gray-600 whitespace-nowrap",
+                        ),
+                    ),
+                    (
+                        "canceling",
+                        rx.el.span("Canceling…", class_name="text-xs text-gray-500 whitespace-nowrap"),
+                    ),
+                    (
+                        "failed",
+                        rx.el.button(
+                            rx.icon("rotate-ccw", size=15),
+                            "Retry images",
+                            on_click=DownloadState.check_companions(item.uid, True),
+                            title="The image download stopped; open the list to retry it",
+                            class_name="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-red-700 bg-red-50 hover:bg-red-100 whitespace-nowrap",
+                        ),
+                    ),
+                    (
+                        "missing",
+                        rx.el.button(
+                            rx.icon("images", size=15),
+                            "Get images",
+                            on_click=DownloadState.check_companions(item.uid, True),
+                            title="Download the images this annotation belongs to",
+                            class_name="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 whitespace-nowrap",
+                        ),
+                    ),
+                    (
+                        "unknown",
+                        rx.el.button(
+                            rx.icon("images", size=15),
+                            "Images?",
+                            on_click=DownloadState.check_companions(item.uid, True),
+                            title="This app could not read which images the annotation belongs to; ask again",
+                            class_name="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 whitespace-nowrap",
+                        ),
+                    ),
+                    rx.fragment(),
                 ),
                 rx.el.button(
                     rx.icon("trash-2", size=16),

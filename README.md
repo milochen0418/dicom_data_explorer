@@ -44,8 +44,10 @@ series (SEG, RTSTRUCT, SR, PR, ...) opens a dialog instead of just queueing
 it: the app reads the annotation's files from IDC to see which image series
 they refer to, lists them ticked, and one button downloads the annotation
 together with its images. When the references cannot be read, the image
-series of the same study are offered instead, unticked. The Downloads page
-keeps a **Get images** button on every annotation downloaded earlier.
+series of the same study are offered instead, unticked. On the Downloads
+page an annotation's row shows whether its images are there, follows their
+download live (waiting, percentage, done), and offers **Get images** when
+they are missing.
 
 ## Design Document
 
