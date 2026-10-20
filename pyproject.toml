@@ -16,7 +16,17 @@ pandas = "*"
 idc-index = ">=0.6.0"
 idc-index-data = "*"
 requests = "*"
+pydicom = "^3.0.2"
 
 [build-system]
 requires = ["poetry-core>=1.7.0"]
 build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.1.1,<10.0.0)"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

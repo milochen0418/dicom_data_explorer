@@ -39,6 +39,14 @@ back to the viewer, which opens them with the annotation on top.
 
 The result is `{"series": [...], "downloaded": [...]}`.
 
+The same works from this side. Pressing **Download** on an annotation
+series (SEG, RTSTRUCT, SR, PR, ...) opens a dialog instead of just queueing
+it: the app reads the annotation's files from IDC to see which image series
+they refer to, lists them ticked, and one button downloads the annotation
+together with its images. When the references cannot be read, the image
+series of the same study are offered instead, unticked. The Downloads page
+keeps a **Get images** button on every annotation downloaded earlier.
+
 ## Design Document
 
 We’ve added a software design document to share the architecture and roadmap. Please reference it and join the open-source development efforts.

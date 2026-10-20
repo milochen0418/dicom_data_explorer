@@ -8,8 +8,9 @@ import dataclasses
 import reflex as rx
 
 from dicom_data_explorer import formatting
-from dicom_data_explorer.services import downloader, idc_service
+from dicom_data_explorer.services import downloader, idc_service, references
 from dicom_data_explorer.services.downloader import Series
+from dicom_data_explorer.states.fetch_state import ACTIVE, Wanted, queue_status
 
 # Ask before downloading a series bigger than this (MB).
 BIG_DOWNLOAD_MB = 1000
@@ -37,6 +38,7 @@ class SavedSeries:
     saved_at: str = ""
     folder: str = ""
     path: str = ""
+    annotation: bool = False  # a SEG, RTSTRUCT, SR, ... that belongs to other images
 
 
 def _title(s: Series) -> str:
@@ -108,6 +110,7 @@ def _load_saved(manager: downloader.DownloadManager) -> list[SavedSeries]:
                 uid=item.id, title=_title(s), subtitle=_subtitle(s),
                 size=formatting.size_bytes(item.bytes), saved_at=item.created_at,
                 folder=f"{item.owner}/{item.id}", path=str(item.path),
+                annotation=s.modality in references.ANNOTATION_MODALITIES,
             )
         )
     return saved
@@ -124,6 +127,20 @@ class DownloadState(rx.State):
     big_text: str = ""
     delete_uid: str = ""
     delete_title: str = ""
+    # Downloading an annotation: the dialog that offers its images along with it.
+    bundle_uid: str = ""  # the annotation; "" closes the dialog
+    bundle_title: str = ""
+    bundle_subtitle: str = ""
+    bundle_loading: bool = False  # its files are being read for their references
+    bundle_note: str = ""  # why the list is a guess, when it is
+    bundle_rows: list[Wanted] = []
+    bundle_selected: dict[str, bool] = {}
+    _bundle_rows: dict[str, dict] = {}
+    # An annotation downloaded earlier (Downloads page) and the series it belongs to.
+    companion_uid: str = ""
+    companion_title: str = ""
+    companions: list[Wanted] = []
+    _companion_rows: dict[str, dict] = {}
 
     _version: int = -1
     _seq: int = -1  # last finished download this tab has announced
@@ -147,6 +164,28 @@ class DownloadState(rx.State):
     @rx.var
     def saved_total(self) -> str:
         return f"{formatting.count(len(self.saved))} series"
+
+    @rx.var
+    def companions_label(self) -> str:
+        pending = [w for w in self.companions if w.in_index and w.status not in ("done", *ACTIVE)]
+        if not pending:
+            return "Download"
+        size = sum(float(self._companion_rows.get(w.uid, {}).get("series_size_MB") or 0) for w in pending)
+        count = f"{len(pending)} series" if len(pending) > 1 else "the series"
+        return f"Download {count} ({formatting.size_mb(size)})"
+
+    @rx.var
+    def companions_pending(self) -> bool:
+        return any(w.in_index and w.status not in ("done", *ACTIVE) for w in self.companions)
+
+    @rx.var
+    def bundle_label(self) -> str:
+        """The confirm button: the annotation plus the selected images, with their size."""
+        chosen = [w for w in self.bundle_rows if self.bundle_selected.get(w.uid) and w.status not in ("done", *ACTIVE)]
+        size = sum(float(self._bundle_rows.get(w.uid, {}).get("series_size_MB") or 0) for w in chosen)
+        size += float(self._bundle_rows.get(self.bundle_uid, {}).get("series_size_MB") or 0)
+        count = 1 + len(chosen)
+        return f"Download {count} series ({formatting.size_mb(size)})" if chosen else f"Download the annotation only ({formatting.size_mb(size)})"
 
     # -- syncing with the shared queue ----------------------------------------
 
@@ -222,6 +261,9 @@ class DownloadState(rx.State):
         series = await asyncio.to_thread(downloader.lookup_series, uid)
         if series is None:
             return rx.toast.error("This series is not in the IDC index.")
+        if series.modality in references.ANNOTATION_MODALITIES and not confirmed:
+            # An annotation belongs to other images: offer to fetch them along with it.
+            return DownloadState.ask_bundle(uid)
         if series.size_mb >= BIG_DOWNLOAD_MB and not confirmed:
             self.big_uid = uid
             self.big_text = (
@@ -285,3 +327,179 @@ class DownloadState(rx.State):
     @rx.event
     def copy_path(self, path: str):
         return [rx.set_clipboard(path), rx.toast.info("Folder path copied.")]
+
+    # -- downloading an annotation together with the images it belongs to ---------
+
+    @rx.event(background=True)
+    async def ask_bundle(self, uid: str):
+        """Open the dialog for annotation `uid`, read what it refers to, list it.
+
+        A background task: reading the files from IDC takes seconds, and the
+        dialog's Cancel must work meanwhile.
+        """
+        rows = await asyncio.to_thread(idc_service.series_by_uid, [uid])
+        row = rows.get(uid)
+        if row is None:
+            yield rx.toast.error("This series is not in the IDC index.")
+            return
+        series = Series.from_index(row)
+        async with self:
+            self.bundle_uid = uid
+            self.bundle_title = _title(series)
+            self.bundle_subtitle = _subtitle(series)
+            self.bundle_loading = True
+            self.bundle_note = ""
+            self.bundle_rows = []
+            self.bundle_selected = {}
+            self._bundle_rows = {uid: row}
+        note = ""
+        try:
+            needed = await asyncio.to_thread(references.peek_series, series.aws_url, uid)
+        except references.ReferencesUnavailable as error:
+            needed = set()
+            note = str(error)
+        candidates = {}
+        if needed:
+            candidates = await asyncio.to_thread(idc_service.series_by_uid, sorted(needed))
+            preselect = True
+            missing_from_index = sorted(needed - set(candidates))
+            if missing_from_index:
+                note = f"{len(missing_from_index)} referenced series are not in the IDC index."
+        else:
+            # Could not tell: offer the image series of the same study, unticked.
+            study = [
+                r for r in await asyncio.to_thread(
+                    idc_service.image_series_in_study, str(row.get("StudyInstanceUID") or ""), references.IMAGE_MODALITIES
+                )
+                if r["SeriesInstanceUID"] != uid
+            ]
+            candidates = {r["SeriesInstanceUID"]: r for r in study}
+            preselect = False
+            if study:
+                note = (note + " " if note else "") + "These are the image series of the same study; tick the ones to download."
+            elif not note:
+                note = "This object does not say which images it belongs to."
+        async with self:
+            if self.bundle_uid != uid:
+                return  # closed meanwhile
+            manager = downloader.get_manager()
+            jobs = {job["series"].uid: job for job in manager.snapshot()["jobs"]}
+            rows_out, selected = [], {}
+            for ref, r in candidates.items():
+                s = Series.from_index(r)
+                status, percent, extra = queue_status(ref, manager, jobs)
+                rows_out.append(Wanted(uid=ref, title=_title(s), subtitle=_subtitle(s), status=status, percent=percent, note=extra))
+                selected[ref] = preselect and status not in ("done", *ACTIVE)
+            self.bundle_rows = rows_out
+            self.bundle_selected = selected
+            self._bundle_rows = {**self._bundle_rows, **candidates}
+            self.bundle_note = note
+            self.bundle_loading = False
+
+    @rx.event
+    def toggle_bundle(self, uid: str, checked: bool):
+        self.bundle_selected = {**self.bundle_selected, uid: bool(checked)}
+
+    @rx.event
+    def confirm_bundle(self, only_annotation: bool = False):
+        """Queue the annotation and, unless `only_annotation`, the ticked image series."""
+        uid = self.bundle_uid
+        if not uid:
+            return None
+        manager = downloader.get_manager()
+        queued = 0
+        wanted = [uid]
+        if not only_annotation:
+            wanted += [w.uid for w in self.bundle_rows if self.bundle_selected.get(w.uid)]
+        for ref in wanted:
+            row = self._bundle_rows.get(ref)
+            if row is not None and manager.add(Series.from_index(row)) == "queued":
+                queued += 1
+        self.bundle_uid = ""
+        self.bundle_rows = []
+        self.bundle_selected = {}
+        self._bundle_rows = {}
+        self._apply(manager.snapshot(), None)
+        events = [self._start_watching(manager)]
+        if queued:
+            events.append(rx.toast.info(f"Queued {queued} series." if queued > 1 else "Queued 1 series."))
+        else:
+            events.append(rx.toast.info("Already downloaded — see Downloads."))
+        return [e for e in events if e is not None]
+
+    @rx.event
+    def cancel_bundle(self):
+        self.bundle_uid = ""
+        self.bundle_loading = False
+        self.bundle_rows = []
+        self.bundle_selected = {}
+        self._bundle_rows = {}
+
+    # -- the images an annotation belongs to --------------------------------------
+
+    @rx.event
+    async def check_companions(self, uid: str, asked: bool = False):
+        """Read what the downloaded annotation `uid` refers to and offer what is missing.
+
+        Runs after an annotation finishes downloading, and from the Downloads
+        page (`asked`), where "nothing missing" is worth a word.
+        """
+        manager = downloader.get_manager()
+        collection = manager.collection()
+        if not collection.has(uid):
+            return rx.toast.error("That series is not in the DICOM folder.") if asked else None
+        try:
+            needed = await asyncio.to_thread(references.series_referenced_by, collection.own_dir / uid, uid)
+        except references.ReferencesUnavailable as error:
+            return rx.toast.error(str(error)) if asked else None
+        missing = sorted(u for u in needed if not collection.has(u))
+        if not missing:
+            if asked:
+                return rx.toast.info(
+                    "Every series this annotation refers to is downloaded."
+                    if needed else "This object does not say which images it belongs to."
+                )
+            return None
+        rows = await asyncio.to_thread(idc_service.series_by_uid, missing)
+        jobs = {job["series"].uid: job for job in manager.snapshot()["jobs"]}
+        companions = []
+        for ref in missing:
+            row = rows.get(ref)
+            if row is None:
+                companions.append(Wanted(uid=ref, title=f"Series …{ref[-12:]}", subtitle="Not in the IDC index", in_index=False))
+                continue
+            s = Series.from_index(row)
+            status, percent, note = queue_status(ref, manager, jobs)
+            companions.append(Wanted(uid=ref, title=_title(s), subtitle=_subtitle(s), status=status, percent=percent, note=note))
+        if not any(w.in_index for w in companions):
+            return rx.toast.info("The images this annotation refers to are not in the IDC index.") if asked else None
+        saved = next((s for s in self.saved if s.uid == uid), None)
+        self.companion_uid = uid
+        self.companion_title = saved.title if saved else f"Series …{uid[-12:]}"
+        self.companions = companions
+        self._companion_rows = rows
+        return None
+
+    @rx.event
+    def download_companions(self):
+        """Queue the series the annotation belongs to, then watch them like any download."""
+        manager = downloader.get_manager()
+        queued = 0
+        for w in self.companions:
+            if w.in_index and w.status not in ("done", *ACTIVE):
+                manager.add(Series.from_index(self._companion_rows[w.uid]))
+                queued += 1
+        self.companion_uid = ""
+        self.companions = []
+        self._companion_rows = {}
+        self._apply(manager.snapshot(), None)
+        events = [self._start_watching(manager)]
+        if queued:
+            events.append(rx.toast.info(f"Queued {queued} series the annotation belongs to."))
+        return [e for e in events if e is not None]
+
+    @rx.event
+    def dismiss_companions(self):
+        self.companion_uid = ""
+        self.companions = []
+        self._companion_rows = {}

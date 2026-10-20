@@ -175,6 +175,19 @@ def series_by_uid(uids: list[str]) -> dict[str, dict]:
     return {r["SeriesInstanceUID"]: r for r in rows}
 
 
+def image_series_in_study(study_uid: str, modalities) -> list[dict]:
+    """Index rows of the image series (by `modalities`) in a study, biggest first."""
+    modalities = sorted(modalities)
+    if not study_uid or not modalities:
+        return []
+    marks = ", ".join("?" for _ in modalities)
+    return _query(
+        f"SELECT {_ROW_COLUMNS} FROM series WHERE StudyInstanceUID = ? AND Modality IN ({marks}) "
+        "ORDER BY series_size_MB DESC NULLS LAST",
+        [study_uid, *modalities],
+    )
+
+
 def viewer_url(study_uid: str, series_uid: str, modality: str) -> str:
     """IDC's own web viewer for one series (Slim for slides, OHIF otherwise)."""
     if not study_uid or not series_uid:

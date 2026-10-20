@@ -1,7 +1,12 @@
 import reflex as rx
 from dicom_data_explorer.components.sidebar import sidebar
 from dicom_data_explorer.components.onboarding import onboarding_modal
-from dicom_data_explorer.components.dialogs import big_download_dialog, delete_dialog
+from dicom_data_explorer.components.dialogs import (
+    big_download_dialog,
+    bundle_dialog,
+    companion_dialog,
+    delete_dialog,
+)
 
 
 def layout(content: rx.Component) -> rx.Component:
@@ -12,5 +17,7 @@ def layout(content: rx.Component) -> rx.Component:
         onboarding_modal(),
         big_download_dialog(),
         delete_dialog(),
+        companion_dialog(),
+        bundle_dialog(),
         class_name="flex h-screen w-screen overflow-hidden font-['Inter'] text-gray-900",
     )

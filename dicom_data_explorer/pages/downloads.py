@@ -168,11 +168,24 @@ def saved_row(item: SavedSeries) -> rx.Component:
             class_name="px-4 py-3",
         ),
         rx.el.td(
-            rx.el.button(
-                rx.icon("trash-2", size=16),
-                on_click=DownloadState.ask_delete(item.uid, item.title),
-                title="Delete this series",
-                class_name="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg",
+            rx.el.div(
+                rx.cond(
+                    item.annotation,
+                    rx.el.button(
+                        rx.icon("images", size=15),
+                        "Get images",
+                        on_click=DownloadState.check_companions(item.uid, True),
+                        title="Download the images this annotation belongs to",
+                        class_name="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 whitespace-nowrap",
+                    ),
+                ),
+                rx.el.button(
+                    rx.icon("trash-2", size=16),
+                    on_click=DownloadState.ask_delete(item.uid, item.title),
+                    title="Delete this series",
+                    class_name="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg",
+                ),
+                class_name="flex items-center justify-end gap-2",
             ),
             class_name="px-4 py-3 text-right",
         ),

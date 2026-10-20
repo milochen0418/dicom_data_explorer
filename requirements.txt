@@ -3,4 +3,4 @@ reflex==0.10.0
 pandas
 idc-index
 idc-index-data
-requests
+requestspydicom

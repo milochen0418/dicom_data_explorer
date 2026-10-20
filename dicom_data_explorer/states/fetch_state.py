@@ -49,7 +49,7 @@ def _subtitle(s: Series) -> str:
     return " · ".join(p for p in parts if p)
 
 
-def _status(uid: str, manager: downloader.DownloadManager, jobs: dict[str, dict]) -> tuple[str, int, str]:
+def queue_status(uid: str, manager: downloader.DownloadManager, jobs: dict[str, dict]) -> tuple[str, int, str]:
     """(status, percent, note) of a series in the shared queue and the collection."""
     if manager.collection().has(uid):
         return "done", 100, ""
@@ -107,7 +107,7 @@ class FetchState(rx.State):
         updated = []
         for w in self.wanted:
             if w.in_index:
-                status, percent, note = _status(w.uid, manager, jobs)
+                status, percent, note = queue_status(w.uid, manager, jobs)
                 w = Wanted(w.uid, w.title, w.subtitle, True, status, percent, note)
             updated.append(w)
         self.wanted = updated
