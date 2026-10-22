@@ -917,6 +917,27 @@ files = [
 crypto = ["cryptography (>=3.4.0)"]
 
 [[package]]
+name = "pynetdicom"
+version = "3.0.4"
+description = "A Python implementation of the DICOM networking protocol"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "pynetdicom-3.0.4-py3-none-any.whl", hash = "sha256:bc3f8869db4c90634336dfb02d7b6c249771e8b167e841254997a315d8e16f72"},
+    {file = "pynetdicom-3.0.4.tar.gz", hash = "sha256:567ef761d73b34a380a4350e0d10ae549d749c66da4f1bdf8793cab9a6a326e4"},
+]
+
+[package.dependencies]
+pydicom = ">=3,<4"
+
+[package.extras]
+apps = ["sqlalchemy"]
+dev = ["asv (>=0.6)", "black (>=23.1)", "codespell (>=2.2)", "coverage (>=7.3)", "mypy (>=1.11)", "pyfakefs (>=5.3)", "pytest (>=7.4)", "pytest-cov (>=4.1)", "pytest-xdist (>=3.7)", "ruff (>=0.1)", "sqlalchemy (>=2.0)"]
+docs = ["numpydoc (>=1.6)", "pydata-sphinx-theme (>=0.16.1)", "sphinx (>=7.2)", "sphinx-copybutton (>=0.5)", "sphinxcontrib-jquery (>=4.1)"]
+tests = ["coverage (>=7.3)", "pyfakefs (>=5.3)", "pytest (>=7.4)", "pytest-cov (>=4.1)", "pytest-xdist (>=3.7)", "sqlalchemy (>=2.0)"]
+
+[[package]]
 name = "pytest"
 version = "9.1.1"
 description = "pytest: simple powerful testing with Python"
@@ -1779,4 +1800,4 @@ h11 = ">=0.16.0,<1"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.15"
-content-hash = "927ebf2558c4fe8c05474562a3978b6cfa9102ac65f6c23dbe0b4db9dbfb8c5f"
+content-hash = "d69f51ed151d9c69a68f9d0fc4693ff64d5d09d1eead3dfc8a475579b072b25a"

@@ -77,8 +77,9 @@ def sidebar() -> rx.Component:
             class_name="h-16 flex items-center gap-3 px-6 border-b border-gray-100",
         ),
         rx.el.nav(
-            sidebar_item("Find series", "search", "/", path != "/downloads"),
+            sidebar_item("Find series", "search", "/", (path != "/downloads") & (path != "/pacs")),
             sidebar_item("Downloads", "download", "/downloads", path == "/downloads", downloads_badge()),
+            sidebar_item("PACS", "server", "/pacs", path == "/pacs"),
             class_name="px-3 py-5",
         ),
         rx.el.div(class_name="flex-1"),

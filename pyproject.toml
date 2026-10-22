@@ -17,6 +17,7 @@ idc-index = ">=0.6.0"
 idc-index-data = "*"
 requests = "*"
 pydicom = "^3.0.2"
+pynetdicom = "^3.0.4"
 
 [build-system]
 requires = ["poetry-core>=1.7.0"]

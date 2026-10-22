@@ -1,8 +1,10 @@
 import reflex as rx
 from dicom_data_explorer.states.idc_state import IDCState, SeriesRow
+from dicom_data_explorer.states.pacs_search_state import PacsSearchState
 from dicom_data_explorer.states.ui_state import UIState
 from dicom_data_explorer.components.layout import layout
 from dicom_data_explorer.components.download_button import download_button
+from dicom_data_explorer.components.pacs_search import pacs_search_content, source_picker
 from dicom_data_explorer.components.tooltip import helper_tooltip
 
 _FIELD = "w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
@@ -316,35 +318,43 @@ def details_panel() -> rx.Component:
     )
 
 
+def idc_content() -> rx.Component:
+    return rx.fragment(
+        rx.el.div(
+            rx.el.div(
+                rx.el.h1("Find DICOM series", class_name="text-2xl font-bold text-gray-900"),
+                rx.el.p(
+                    "Public imaging data from the NCI Imaging Data Commons (IDC).",
+                    class_name="text-gray-500 mt-0.5",
+                ),
+            ),
+            rx.cond(
+                UIState.guide_hidden != "",
+                rx.el.button(
+                    rx.icon("circle-help", size=16),
+                    "How it works",
+                    on_click=UIState.show_guide,
+                    class_name="flex items-center gap-1.5 text-sm text-gray-600 hover:text-blue-700",
+                ),
+            ),
+            class_name="flex items-end justify-between mb-4",
+        ),
+        guide(),
+        filter_bar(),
+        result_header(),
+        results(),
+    )
+
+
 def idc_search_content() -> rx.Component:
     return rx.el.div(
         rx.el.div(
-            rx.el.div(
-                rx.el.div(
-                    rx.el.h1("Find DICOM series", class_name="text-2xl font-bold text-gray-900"),
-                    rx.el.p(
-                        "Public imaging data from the NCI Imaging Data Commons (IDC).",
-                        class_name="text-gray-500 mt-0.5",
-                    ),
-                ),
-                rx.cond(
-                    UIState.guide_hidden != "",
-                    rx.el.button(
-                        rx.icon("circle-help", size=16),
-                        "How it works",
-                        on_click=UIState.show_guide,
-                        class_name="flex items-center gap-1.5 text-sm text-gray-600 hover:text-blue-700",
-                    ),
-                ),
-                class_name="flex items-end justify-between mb-4",
-            ),
-            guide(),
-            filter_bar(),
-            result_header(),
-            results(),
+            # The picker appears once a PACS is set up on the PACS page.
+            rx.cond(PacsSearchState.choices.length() > 1, source_picker()),
+            rx.cond(PacsSearchState.on_pacs, pacs_search_content(), idc_content()),
             class_name="flex-1 min-w-0 h-full overflow-y-auto p-6 lg:p-8",
         ),
-        details_panel(),
+        rx.cond(PacsSearchState.on_pacs, rx.fragment(), details_panel()),
         class_name="relative flex h-full w-full",
     )
 

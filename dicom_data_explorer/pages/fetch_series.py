@@ -105,7 +105,7 @@ def fetch_series_page() -> rx.Component:
             ~FetchState.loaded,
             rx.el.p(
                 rx.icon("loader-circle", size=16, class_name="animate-spin"),
-                "Looking up the series in the IDC index…",
+                "Looking up the series…",
                 class_name="flex items-center gap-2 text-sm text-gray-500 mt-4",
             ),
             rx.el.div(rx.foreach(FetchState.wanted, _wanted_row), class_name="mt-3"),
@@ -113,7 +113,7 @@ def fetch_series_page() -> rx.Component:
         rx.cond(
             FetchState.unknown_count > 0,
             rx.el.p(
-                "Series that are not in the IDC index cannot be fetched from here.",
+                "Series that no source has cannot be fetched from here.",
                 class_name="text-xs text-gray-500 mt-2",
             ),
         ),

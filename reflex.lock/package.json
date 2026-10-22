@@ -12,6 +12,7 @@
     "lucide-react": "1.26.0",
     "mergician": "v2.0.2",
     "react": "19.3.0",
+    "react-debounce-input": "3.3.0",
     "react-dom": "19.3.0",
     "react-error-boundary": "6.1.6",
     "react-helmet": "6.1.0",

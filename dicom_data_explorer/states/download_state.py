@@ -8,7 +8,7 @@ import dataclasses
 import reflex as rx
 
 from dicom_data_explorer import formatting
-from dicom_data_explorer.services import downloader, idc_service, references
+from dicom_data_explorer.services import downloader, idc_service, references, sources
 from dicom_data_explorer.services.downloader import Series
 from dicom_data_explorer.states.fetch_state import ACTIVE, Wanted, queue_status
 
@@ -50,10 +50,12 @@ def _title(s: Series) -> str:
 
 
 def _subtitle(s: Series) -> str:
-    parts = [s.collection, s.modality, s.body_part]
+    # A PACS series has no IDC collection: name its PACS instead.
+    parts = ["" if s.source == "idc" else sources.label_of(s.source), s.collection, s.modality, s.body_part]
     if s.images:
-        parts.append(f"{formatting.count(s.images)} images")
-    parts.append(formatting.size_mb(s.size_mb))
+        parts.append(f"{formatting.count(s.images)} image{'' if s.images == 1 else 's'}")
+    if s.size_mb > 0:
+        parts.append(formatting.size_mb(s.size_mb))
     return " · ".join(p for p in parts if p)
 
 
@@ -61,16 +63,15 @@ def _card(job: dict) -> JobCard:
     s: Series = job["series"]
     status = job["status"]
     done, total = job["bytes_done"], job["bytes_total"]
-    percent = int(done * 100 / total) if total else 0
+    percent = downloader.percent(job)
     progress = rate = note = ""
     if job["files_total"]:
-        progress = (
-            f"{formatting.count(job['files_done'])} of {formatting.count(job['files_total'])} files"
-            f" · {formatting.size_bytes(done) if done else '0 MB'} of {formatting.size_bytes(total)}"
-        )
+        files = f"{formatting.count(job['files_done'])} of {formatting.count(job['files_total'])} files"
+        got = formatting.size_bytes(done) if done else "0 MB"
+        progress = f"{files} · {got} of {formatting.size_bytes(total)}" if total else f"{files} · {got} so far"
     if status == downloader.RUNNING:
         if not job["files_total"]:
-            note = "Asking IDC for the file list…"
+            note = f"Asking {sources.label_of(s.source)} for the file list…"
         elif job["speed"] > 0:
             rate = formatting.speed(job["speed"])
             if job["eta"] >= 0:
@@ -162,6 +163,9 @@ def _load_saved(manager: downloader.DownloadManager) -> list[SavedSeries]:
             images=int(m.get("ImageCount") or 0),
         )
         s.size_mb = item.bytes / 1e6
+        kind, _, source_id = str(item.manifest.get("source") or "").partition(":")
+        if kind in ("dimse", "dicomweb"):  # from a PACS (see the sources' origin()): name it
+            s.source = source_id
         annotation = s.modality in references.ANNOTATION_MODALITIES
         images, needs = _images_state(item, collection) if annotation else ("", [])
         saved.append(
@@ -346,6 +350,13 @@ class DownloadState(rx.State):
             saved = await asyncio.to_thread(_load_saved, manager)
             self._apply(manager.snapshot(), saved)
             return rx.toast.info("Already downloaded — see Downloads.")
+        return self._start_watching(manager)
+
+    @rx.event
+    def follow(self):
+        """Show downloads another page queued (the PACS search), and watch them."""
+        manager = downloader.get_manager()
+        self._apply(manager.snapshot(), None)
         return self._start_watching(manager)
 
     @rx.event

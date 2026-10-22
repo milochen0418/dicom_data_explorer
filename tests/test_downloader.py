@@ -12,6 +12,7 @@ from reflex_ddns_auth.collections import TMP_DIR, Collection
 
 from dicom_data_explorer.services import downloader
 from dicom_data_explorer.services.downloader import DownloadManager, Series
+from dicom_data_explorer.services.sources import idc
 
 BUCKET = "idc-open-data"
 PREFIX = "series-uuid/"
@@ -212,7 +213,7 @@ def test_delete_removes_a_downloaded_series(make, s3):
 
 
 def test_parse_s3_url():
-    assert downloader.parse_s3_url("s3://idc-open-data/abc/*") == ("idc-open-data", "abc/")
-    assert downloader.parse_s3_url("https://b.s3.amazonaws.com/x/y") == ("b", "x/y")
+    assert idc.parse_s3_url("s3://idc-open-data/abc/*") == ("idc-open-data", "abc/")
+    assert idc.parse_s3_url("https://b.s3.amazonaws.com/x/y") == ("b", "x/y")
     with pytest.raises(downloader.DownloadError):
-        downloader.parse_s3_url("ftp://nope")
+        idc.parse_s3_url("ftp://nope")

@@ -98,13 +98,13 @@ def peek_series(aws_url: str, own_uid: str = "", session: requests.Session | Non
     Fetches its files into memory (they are small) and parses their headers.
     Raises ReferencesUnavailable when they cannot be read.
     """
-    from dicom_data_explorer.services import downloader
+    from dicom_data_explorer.services.sources import idc
 
     pydicom = _pydicom()
     session = session or requests.Session()
     try:
-        bucket, prefix = downloader.parse_s3_url(aws_url)
-        objects = downloader.list_objects(session, bucket, prefix)
+        bucket, prefix = idc.parse_s3_url(aws_url)
+        objects = idc.list_objects(session, bucket, prefix)
     except Exception as error:  # noqa: BLE001 - network or a bad URL
         raise ReferencesUnavailable(f"IDC could not be reached: {error}") from error
     found: set[str] = set()

@@ -122,8 +122,8 @@ def in_progress() -> rx.Component:
     return rx.el.section(
         rx.el.h2("In progress", class_name="text-lg font-bold text-gray-900 mb-1"),
         rx.el.p(
-            "One series at a time, 8 files in parallel. You can keep browsing or close the tab: "
-            "downloads continue in the background.",
+            "Each source downloads one series at a time: IDC 8 files in parallel, a PACS at most 2, so as not "
+            "to slow it down for its doctors. You can keep browsing or close the tab: downloads continue in the background.",
             class_name="text-sm text-gray-500 mb-4",
         ),
         rx.cond(

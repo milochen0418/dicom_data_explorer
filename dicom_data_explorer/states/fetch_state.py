@@ -1,10 +1,12 @@
 """The `dicom.fetch-series` intent: download the series an annotation needs, then hand back.
 
 DICOM Viewer opens this page in a dialog with the SeriesInstanceUIDs an
-annotation object (SEG, RTSTRUCT, SR, PR) refers to, and the annotation's
-label. The page lists those series from the IDC index, downloads them with
-the shared queue, and finishes the intent once every one of them is in the
-collection, so the viewer can open them with the annotation on top.
+annotation object (SEG, RTSTRUCT, SR, PR) refers to, the annotation's label
+and, optionally, its StudyInstanceUID. The page looks the series up in the
+IDC index and then on each PACS (a PACS that answers level by level needs
+the study), downloads them with the shared queue, and finishes the intent
+once every one of them is in the collection, so the viewer can open them
+with the annotation on top.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import reflex as rx
 from reflex_ddns_auth.intent import IntentPage
 
 from dicom_data_explorer import formatting
-from dicom_data_explorer.services import downloader, idc_service
+from dicom_data_explorer.services import downloader, idc_service, sources
 from dicom_data_explorer.services.downloader import Series
 
 POLL_SECONDS = 0.5
@@ -42,11 +44,26 @@ def _title(s: Series) -> str:
 
 
 def _subtitle(s: Series) -> str:
-    parts = [s.collection, s.modality, s.body_part]
+    parts = ["" if s.source == "idc" else sources.label_of(s.source), s.collection, s.modality, s.body_part]
     if s.images:
         parts.append(f"{formatting.count(s.images)} images")
-    parts.append(formatting.size_mb(s.size_mb))
+    if s.size_mb > 0:
+        parts.append(formatting.size_mb(s.size_mb))
     return " · ".join(p for p in parts if p)
+
+
+def _find_on_pacs(uids: list[str], study_uid: str) -> dict[str, Series]:
+    """The series some PACS has; the first PACS that has one wins."""
+    found: dict[str, Series] = {}
+    for source in sources.pacs():
+        missing = [uid for uid in uids if uid not in found]
+        if not missing:
+            break
+        try:
+            found.update(source.find_series(missing, study_uid))
+        except Exception:  # noqa: BLE001 - one unreachable PACS must not hide the others
+            logging.exception("Looking up series on %s failed", source.label)
+    return found
 
 
 def queue_status(uid: str, manager: downloader.DownloadManager, jobs: dict[str, dict]) -> tuple[str, int, str]:
@@ -56,8 +73,7 @@ def queue_status(uid: str, manager: downloader.DownloadManager, jobs: dict[str, 
     job = jobs.get(uid)
     if job is None:
         return "", 0, ""
-    done, total = job["bytes_done"], job["bytes_total"]
-    percent = int(done * 100 / total) if total else 0
+    percent = downloader.percent(job)
     note = ""
     if job["status"] == downloader.FAILED:
         note = str(job.get("error") or "The download failed.")
@@ -74,7 +90,8 @@ class FetchState(rx.State):
     loaded: bool = False
     error: str = ""
     _uids: list[str] = []
-    _rows: dict[str, dict] = {}
+    _rows: dict[str, dict] = {}  # IDC index rows, by series UID
+    _pacs: dict[str, dict] = {}  # series found on a PACS (Series fields), by UID
     _watching: bool = False
 
     @rx.var
@@ -100,7 +117,7 @@ class FetchState(rx.State):
             return "Download"
         size = sum(float(self._rows.get(w.uid, {}).get("series_size_MB") or 0) for w in pending)
         count = f"{len(pending)} series" if len(pending) > 1 else "the series"
-        return f"Download {count} ({formatting.size_mb(size)})"
+        return f"Download {count} ({formatting.size_mb(size)})" if size else f"Download {count}"
 
     def _refresh(self, manager: downloader.DownloadManager) -> None:
         jobs = {job["series"].uid: job for job in manager.snapshot()["jobs"]}
@@ -120,7 +137,7 @@ class FetchState(rx.State):
 
     @rx.event
     async def open_intent(self, params: dict):
-        """Entry point of the intent: `series` (comma-separated UIDs) and `title`."""
+        """Entry point of the intent: `series` (comma-separated UIDs), `title` and maybe `study`."""
         self.title = str(params.get("title") or "").strip()
         uids = []
         for uid in str(params.get("series") or "").split(","):
@@ -136,14 +153,22 @@ class FetchState(rx.State):
             rows = {}
             self.error = "The IDC index could not be read."
         self._rows = rows
+        missing = [uid for uid in uids if uid not in rows]
+        study = str(params.get("study") or "").strip()
+        pacs = await asyncio.to_thread(_find_on_pacs, missing, study) if missing else {}
+        self._pacs = {uid: dataclasses.asdict(s) for uid, s in pacs.items()}
+        nowhere = "Not in IDC or on any PACS" if sources.pacs() else "Not in the IDC index"
         wanted = []
         for uid in uids:
             row = rows.get(uid)
-            if row is None:
-                wanted.append(Wanted(uid=uid, title=f"Series …{uid[-12:]}", subtitle="Not in the IDC index", in_index=False))
-            else:
+            if row is not None:
                 s = Series.from_index(row)
-                wanted.append(Wanted(uid=uid, title=_title(s), subtitle=_subtitle(s)))
+            elif uid in pacs:
+                s = pacs[uid]
+            else:
+                wanted.append(Wanted(uid=uid, title=f"Series …{uid[-12:]}", subtitle=nowhere, in_index=False))
+                continue
+            wanted.append(Wanted(uid=uid, title=_title(s), subtitle=_subtitle(s)))
         self.wanted = wanted
         manager = await asyncio.to_thread(downloader.get_manager)
         self._refresh(manager)
@@ -156,7 +181,8 @@ class FetchState(rx.State):
         manager = downloader.get_manager()
         for w in self.wanted:
             if w.in_index and w.status not in ("done", *ACTIVE):
-                manager.add(Series.from_index(self._rows[w.uid]))
+                row = self._rows.get(w.uid)
+                manager.add(Series.from_index(row) if row is not None else Series(**self._pacs[w.uid]))
         self._refresh(manager)
         return self._start_watching(manager)
 

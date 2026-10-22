@@ -1,36 +1,46 @@
-"""Download IDC series into the shared "dicom" collection.
+"""Download series into the shared "dicom" collection.
 
 One queue for the whole app (the backend runs a single worker), so every tab
 sees the same downloads and a series is never fetched twice at the same time.
-Series are downloaded one after another, and the files of a series over
-parallel connections: IDC files are small and served from us-east-1, so
-fetching them one at a time spends nearly all its time waiting.
+Each source has its own lane: its series download one after another, and a
+slow PACS never holds up IDC. The files of a series come over parallel
+connections: IDC files are small and served from us-east-1, so fetching them
+one at a time spends nearly all its time waiting.
+
+Where the files come from is up to the series' source (services/sources):
+the queue asks it for the file list, then either for each file's bytes or,
+for C-GET and C-MOVE, to fetch the whole series and hand each file over.
 
 Files are written into a ``Collection.publish(resume=True)`` staging folder.
 A failed series keeps the files it already has, so Retry fetches only the
 rest; a restart leaves the folder too, and it comes back as "interrupted".
+A journal (one small JSON file per job, outside the collection) remembers
+what each job was, so a PACS series, or one still waiting, comes back too.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import errno
+import json
 import logging
+import re
 import shutil
 import threading
 import time
-import xml.etree.ElementTree as ET
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from pathlib import Path
 from typing import Callable
-from urllib.parse import quote, urlparse
 
 import requests
 from reflex_ddns_auth.collections import TMP_DIR, Collection, Item
 
+from dicom_data_explorer.services import pacs_config, sources
+from dicom_data_explorer.services.sources.base import DownloadError, RemoteFile, Series, Source
+
 COLLECTION = "dicom"
 KIND = "dicom.series"
 PARALLEL_FILES = 8
-CHUNK_BYTES = 256 * 1024
 ATTEMPTS = 3
 FINISHED_KEPT = 50
 
@@ -42,39 +52,12 @@ INTERRUPTED = "interrupted"  # left over from before a restart
 
 
 @dataclasses.dataclass
-class Series:
-    uid: str
-    aws_url: str
-    collection: str = ""
-    modality: str = ""
-    body_part: str = ""
-    description: str = ""
-    date: str = ""
-    images: int = 0
-    size_mb: float = 0.0
-
-    @classmethod
-    def from_index(cls, row: dict) -> "Series":
-        return cls(
-            uid=str(row.get("SeriesInstanceUID") or ""),
-            aws_url=str(row.get("series_aws_url") or ""),
-            collection=str(row.get("collection_id") or ""),
-            modality=str(row.get("Modality") or ""),
-            body_part=str(row.get("BodyPartExamined") or ""),
-            description=str(row.get("SeriesDescription") or ""),
-            date=str(row.get("SeriesDate") or ""),
-            images=int(row.get("instanceCount") or 0),
-            size_mb=float(row.get("series_size_MB") or 0),
-        )
-
-
-@dataclasses.dataclass
 class Job:
     series: Series
     status: str = QUEUED
     files_total: int = 0
     files_done: int = 0
-    bytes_total: int = 0
+    bytes_total: int = 0  # 0 when the source does not say how big the files are
     bytes_done: int = 0
     bytes_at_start: int = 0  # already on disk when this attempt started
     started_at: float = 0.0
@@ -83,79 +66,57 @@ class Job:
     halt: bool = False  # a file failed: start no new files, let the others finish
 
 
-class DownloadError(Exception):
-    pass
-
-
 class _Stopped(Exception):
     pass
 
 
-def parse_s3_url(url: str) -> tuple[str, str]:
-    """``s3://bucket/prefix/*`` (or an https S3 URL) → (bucket, prefix)."""
-    if not url:
-        raise DownloadError("IDC has no storage location for this series.")
-    parsed = urlparse(url)
-    if parsed.scheme == "s3":
-        return parsed.netloc, parsed.path.lstrip("/").replace("*", "")
-    if parsed.scheme in {"http", "https"}:
-        host = parsed.netloc
-        if host.endswith(".s3.amazonaws.com"):
-            return host.split(".s3.amazonaws.com")[0], parsed.path.lstrip("/").replace("*", "")
-        if host == "s3.amazonaws.com":
-            bucket, _, prefix = parsed.path.lstrip("/").partition("/")
-            return bucket, prefix.replace("*", "")
-    raise DownloadError(f"Unsupported storage location: {url}")
+def percent(job: dict) -> int:
+    """How far a snapshot's job is: by bytes when the source said how big the
+    files are, else by files."""
+    if job["bytes_total"]:
+        return int(job["bytes_done"] * 100 / job["bytes_total"])
+    return int(job["files_done"] * 100 / job["files_total"]) if job["files_total"] else 0
 
 
-def list_objects(session, bucket: str, prefix: str) -> list[tuple[str, int]]:
-    """Every file under ``prefix`` with its size (S3 ListObjectsV2, anonymous)."""
-    found: list[tuple[str, int]] = []
-    token = None
-    while True:
-        params = {"list-type": "2", "prefix": prefix}
-        if token:
-            params["continuation-token"] = token
-        resp = session.get(f"https://{bucket}.s3.amazonaws.com", params=params, timeout=(10, 60))
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
-        for node in root.findall("{*}Contents"):
-            key = node.findtext("{*}Key") or ""
-            if key and not key.endswith("/"):
-                found.append((key, int(node.findtext("{*}Size") or 0)))
-        token = root.findtext("{*}NextContinuationToken")
-        if not token:
-            return found
-
-
-def _relative(key: str, prefix: str) -> str:
-    rel = key[len(prefix):] if prefix and key.startswith(prefix) else key.rsplit("/", 1)[-1]
-    return rel.lstrip("/") or key.rsplit("/", 1)[-1]
-
-
-def _transient(exc: BaseException) -> bool:
-    if isinstance(exc, requests.HTTPError):
-        code = exc.response.status_code if exc.response is not None else 0
-        return code == 429 or code >= 500
-    return isinstance(
-        exc, (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError)
-    )
-
-
-def describe_error(exc: BaseException) -> str:
-    """A short message for the user (requests errors are OSErrors too: check them first)."""
-    if isinstance(exc, requests.Timeout):
-        return "IDC stopped responding."
-    if isinstance(exc, requests.ConnectionError):
-        return "Can't reach IDC. Check the internet connection."
-    if isinstance(exc, requests.HTTPError):
-        code = exc.response.status_code if exc.response is not None else "?"
-        return f"IDC answered with HTTP {code}."
+def describe_error(exc: BaseException, source: Source | None = None) -> str:
+    """A short message for the user. The source names its own errors first:
+    requests errors are OSErrors too."""
+    text = source.describe_error(exc) if source is not None else None
+    if text:
+        return text
     if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
         return "The disk is full."
     if isinstance(exc, OSError):
         return f"Couldn't save the files ({exc.strerror or exc})."
     return str(exc) or exc.__class__.__name__
+
+
+class _Sink:
+    """Where a source that fetches a whole series (C-GET, C-MOVE) puts each file.
+
+    Files already on disk and files the listing did not name are skipped, so
+    a resumed retrieve that sends everything again costs time, not files.
+    """
+
+    def __init__(self, manager: DownloadManager, job: Job, item, todo: list[RemoteFile]):
+        self._manager, self._job, self._item = manager, job, item
+        self._wanted = {remote.rel for remote in todo}
+
+    def stopped(self) -> bool:
+        return self._job.stop
+
+    def write(self, rel: str, data: bytes) -> None:
+        manager = self._manager
+        with manager._lock:
+            if self._job.stop or rel not in self._wanted:
+                return
+            self._wanted.discard(rel)
+        with self._item.open(rel) as fh:
+            fh.write(data)
+        with manager._lock:
+            self._job.bytes_done += len(data)
+            self._job.files_done += 1
+            manager._changed()
 
 
 class DownloadManager:
@@ -165,17 +126,20 @@ class DownloadManager:
         parallel: int = PARALLEL_FILES,
         session_factory: Callable[[], requests.Session] = requests.Session,
         retry_delay: float = 1.0,
+        journal_dir: Path | None = None,
     ):
         self._collection_factory = collection_factory or (lambda: Collection(COLLECTION))
         self._session_factory = session_factory
         self._retry_delay = retry_delay
+        self._journal = journal_dir
         self._lock = threading.Lock()
         self._jobs: dict[str, Job] = {}  # queue order
         self._finished: list[dict] = []
         self._seq = 0
         self._version = 0
-        self._worker: threading.Thread | None = None
-        self._pool = ThreadPoolExecutor(parallel, thread_name_prefix="idc-file")
+        self._workers: dict[str, threading.Thread] = {}  # one per source with work queued
+        self._parallel = parallel
+        self._pool = ThreadPoolExecutor(parallel, thread_name_prefix="download-file")
         self._local = threading.local()
 
     # -- public API (called from the UI; never blocks on the network) ---------
@@ -194,8 +158,9 @@ class DownloadManager:
             if job is not None:  # failed or interrupted: try again
                 del self._jobs[series.uid]
             self._jobs[series.uid] = Job(series=series)
+            self._remember(series)
             self._changed()
-            self._ensure_worker()
+            self._ensure_worker(series.source)
             return "queued"
 
     def retry(self, uid: str) -> None:
@@ -206,7 +171,7 @@ class DownloadManager:
             del self._jobs[uid]
             self._jobs[uid] = Job(series=job.series)  # back of the queue
             self._changed()
-            self._ensure_worker()
+            self._ensure_worker(job.series.source)
 
     def cancel(self, uid: str) -> None:
         """Stop or unqueue a download and throw its partial files away."""
@@ -220,6 +185,7 @@ class DownloadManager:
                 return
             del self._jobs[uid]
             self._changed()
+        self._forget(uid)
         self._discard_partial(uid)
 
     def busy(self) -> bool:
@@ -229,10 +195,11 @@ class DownloadManager:
     def snapshot(self) -> dict:
         now = time.monotonic()
         with self._lock:
-            jobs, position = [], 0
+            jobs, positions = [], {}
             for job in self._jobs.values():
+                lane = job.series.source
                 if job.status == QUEUED:
-                    position += 1
+                    positions[lane] = positions.get(lane, 0) + 1
                 elapsed = now - job.started_at if job.status == RUNNING else 0
                 speed = (job.bytes_done - job.bytes_at_start) / elapsed if elapsed >= 1 else 0.0
                 left = job.bytes_total - job.bytes_done
@@ -240,7 +207,7 @@ class DownloadManager:
                     {
                         "series": job.series,
                         "status": job.status,
-                        "position": position if job.status == QUEUED else 0,
+                        "position": positions[lane] if job.status == QUEUED else 0,
                         "files_done": job.files_done,
                         "files_total": job.files_total,
                         "bytes_done": job.bytes_done,
@@ -263,18 +230,21 @@ class DownloadManager:
         with self._lock:
             if uid in self._jobs:
                 return False
+        self._forget(uid)
         return self.collection().remove(uid)
 
     def recover(self, lookup: Callable[[list[str]], dict[str, Series]]) -> int:
-        """List staging folders left by a restart as interrupted downloads."""
+        """List what a restart interrupted as interrupted downloads: staging
+        folders, and journaled jobs that had not started yet."""
         col = self.collection()
+        journal = self._journaled()
         try:
             folders = [
                 p for p in (col.own_dir / TMP_DIR).iterdir()
                 if p.is_dir() and ".replica." not in p.name
             ]
         except OSError:
-            return 0
+            folders = []
         partial: dict[str, list] = {}
         for folder in folders:
             uid = folder.name.rsplit(".", 2)[0]
@@ -282,14 +252,21 @@ class DownloadManager:
                 shutil.rmtree(folder, ignore_errors=True)  # published after all
                 continue
             partial.setdefault(uid, []).append(folder)
-        known = lookup(list(partial)) if partial else {}
+        for uid in [uid for uid in journal if col.has(uid)]:
+            self._forget(uid)  # finished just before the restart
+            del journal[uid]
+        known = {uid: journal[uid] for uid in partial if uid in journal}
+        missing = [uid for uid in partial if uid not in journal]
+        if missing:
+            known.update(lookup(missing))
+        known.update({uid: series for uid, series in journal.items() if uid not in partial})
         added = 0
         with self._lock:
             for uid, series in known.items():
                 if uid in self._jobs:
                     continue
                 kept = [
-                    f for folder in partial[uid] for f in folder.rglob("*")
+                    f for folder in partial.get(uid, []) for f in folder.rglob("*")
                     if f.is_file() and not f.name.endswith(".part")
                     and ".item" not in f.relative_to(folder).parts
                 ]
@@ -306,15 +283,52 @@ class DownloadManager:
                 self._changed()
         return added
 
-    # -- the worker -------------------------------------------------------------
+    # -- the journal ------------------------------------------------------------
+
+    def _journal_file(self, uid: str) -> Path | None:
+        if self._journal is None or not re.fullmatch(r"[0-9.]+", uid):
+            return None
+        return self._journal / f"{uid}.json"
+
+    def _remember(self, series: Series) -> None:
+        path = self._journal_file(series.uid)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(dataclasses.asdict(series)))
+        except OSError:
+            logging.exception("Could not journal the download of %s", series.uid)
+
+    def _forget(self, uid: str) -> None:
+        path = self._journal_file(uid)
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+    def _journaled(self) -> dict[str, Series]:
+        if self._journal is None:
+            return {}
+        fields = {f.name for f in dataclasses.fields(Series)}
+        found = {}
+        for path in self._journal.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                series = Series(**{k: v for k, v in data.items() if k in fields})
+            except (OSError, ValueError, TypeError):
+                continue
+            found[series.uid] = series
+        return found
+
+    # -- the workers --------------------------------------------------------------
 
     def _changed(self) -> None:
         self._version += 1
 
-    def _ensure_worker(self) -> None:
-        if self._worker is None:
-            self._worker = threading.Thread(target=self._run, name="idc-download", daemon=True)
-            self._worker.start()
+    def _ensure_worker(self, lane: str) -> None:
+        if lane not in self._workers:
+            worker = threading.Thread(target=self._run, args=(lane,), name=f"download-{lane}", daemon=True)
+            self._workers[lane] = worker
+            worker.start()
 
     def _session(self) -> requests.Session:
         session = getattr(self._local, "session", None)
@@ -331,12 +345,14 @@ class DownloadManager:
         del self._finished[:-FINISHED_KEPT]
         self._changed()
 
-    def _run(self) -> None:
+    def _run(self, lane: str) -> None:
         while True:
             with self._lock:
-                job = next((j for j in self._jobs.values() if j.status == QUEUED), None)
+                job = next(
+                    (j for j in self._jobs.values() if j.status == QUEUED and j.series.source == lane), None
+                )
                 if job is None:
-                    self._worker = None
+                    del self._workers[lane]
                     return
                 job.status, job.stop, job.halt, job.error = RUNNING, False, False, ""
                 job.started_at = time.monotonic()
@@ -348,18 +364,20 @@ class DownloadManager:
                 with self._lock:
                     self._jobs.pop(job.series.uid, None)
                     self._finish(job, "canceled")
+                self._forget(job.series.uid)
             except Exception as exc:  # noqa: BLE001 - reported on the job
                 logging.exception("Download of %s failed", job.series.uid)
                 with self._lock:
-                    job.status, job.error = FAILED, describe_error(exc)
+                    job.status, job.error = FAILED, describe_error(exc, sources.get(job.series.source))
                     job.stop = job.halt = False
                     self._finish(job, "failed")
             else:
                 with self._lock:
                     self._jobs.pop(job.series.uid, None)
                     self._finish(job, "done")
+                self._forget(job.series.uid)
 
-    def _with_retries(self, job: Job, fn: Callable[[], object]):
+    def _with_retries(self, job: Job, source: Source, fn: Callable[[], object]):
         for attempt in range(1, ATTEMPTS + 1):
             if job.stop or job.halt:
                 raise _Stopped()
@@ -368,16 +386,18 @@ class DownloadManager:
             except _Stopped:
                 raise
             except Exception as exc:
-                if attempt == ATTEMPTS or not _transient(exc):
+                if attempt == ATTEMPTS or not source.is_transient(exc):
                     raise
                 time.sleep(self._retry_delay * attempt)
 
     def _download(self, job: Job) -> None:
         s = job.series
-        bucket, prefix = parse_s3_url(s.aws_url)
-        objects = self._with_retries(job, lambda: list_objects(self._session(), bucket, prefix))
-        if not objects:
-            raise DownloadError("IDC lists no files for this series.")
+        source = sources.get(s.source)
+        if source is None:
+            raise DownloadError(f"Unknown data source: {s.source}")
+        files = self._with_retries(job, source, lambda: source.list_files(s, self._session()))
+        if not files:
+            raise DownloadError(f"{source.label} lists no files for this series.")
         col = self.collection()
         if col.has(s.uid):
             return
@@ -389,62 +409,98 @@ class DownloadManager:
             s.uid,
             kind=KIND,
             title=" · ".join(v for v in (s.collection, s.modality) if v),
-            source=s.aws_url,
+            source=source.origin(s),
             meta={k: v for k, v in meta.items() if v},
             resume=True,
         ) as item:
             todo, kept_files, kept_bytes = [], 0, 0
-            for key, size in objects:
-                rel = _relative(key, prefix)
-                dest = item.file(rel)
-                if dest.is_file() and dest.stat().st_size == size:
-                    kept_files, kept_bytes = kept_files + 1, kept_bytes + size
+            for remote in files:
+                dest = item.file(remote.rel)
+                # Complete files are kept: the right size, or, when the source does
+                # not say, just being there (a .part file is renamed only when whole).
+                if dest.is_file() and remote.size in (0, dest.stat().st_size):
+                    kept_files, kept_bytes = kept_files + 1, kept_bytes + dest.stat().st_size
                 else:
-                    todo.append((key, rel))
+                    todo.append(remote)
             with self._lock:
-                job.files_total, job.files_done = len(objects), kept_files
-                job.bytes_total = sum(size for _, size in objects)
+                job.files_total, job.files_done = len(files), kept_files
+                job.bytes_total = sum(remote.size for remote in files)
                 job.bytes_done = job.bytes_at_start = kept_bytes
                 job.started_at = time.monotonic()
                 self._changed()
-            futures = [
-                self._pool.submit(self._fetch_file, job, bucket, key, item, rel)
-                for key, rel in todo
-            ]
-            done, _ = wait(futures, return_when=FIRST_EXCEPTION)
-            failure = next((f.exception() for f in done if f.exception() is not None), None)
-            if failure is not None:
-                job.halt = True
-                wait(futures)
+            if source.per_file:
+                failure = self._fetch_files(job, source, todo, item)
+            else:
+                failure = self._fetch_series(job, source, todo, item)
             if job.status == CANCELING:
                 item.discard()
                 raise _Stopped()
             if failure is not None:
                 raise failure  # leaves the staging folder for Retry
+            missing = sum(1 for remote in files if not item.file(remote.rel).is_file())
+            if missing:
+                raise DownloadError(f"{missing} of {len(files)} files did not arrive. Retry fetches the rest.")
 
-    def _fetch_file(self, job: Job, bucket: str, key: str, item, rel: str) -> None:
-        url = f"https://{bucket}.s3.amazonaws.com/{quote(key, safe='/')}"
+    def _fetch_files(self, job: Job, source: Source, todo: list[RemoteFile], item) -> BaseException | None:
+        """Read each file through the source, at most `source.parallel` at a time.
 
+        The lane thread waits for a free slot, so a slow PACS never holds pool
+        threads that IDC could use.
+        """
+        slots = threading.Semaphore(min(source.parallel or self._parallel, self._parallel))
+        failed = threading.Event()
+
+        def one(remote: RemoteFile) -> None:
+            try:
+                self._fetch_file(job, source, remote, item)
+            except BaseException:
+                failed.set()
+                raise
+            finally:
+                slots.release()
+
+        futures = []
+        for remote in todo:
+            slots.acquire()
+            if failed.is_set() or job.stop:
+                slots.release()
+                break
+            futures.append(self._pool.submit(one, remote))
+        done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+        errors = [f.exception() for f in done if f.exception() is not None]
+        if errors:
+            job.halt = True
+            wait(futures)
+        return next((e for e in errors if not isinstance(e, _Stopped)), errors[0] if errors else None)
+
+    def _fetch_series(self, job: Job, source: Source, todo: list[RemoteFile], item) -> BaseException | None:
+        if not todo:
+            return None
+        try:
+            source.fetch(job.series, todo, _Sink(self, job, item, todo))
+        except Exception as exc:  # noqa: BLE001 - _download decides: canceled or failed
+            return exc
+        return None
+
+    def _fetch_file(self, job: Job, source: Source, remote: RemoteFile, item) -> None:
         def fetch() -> None:
             written = 0
             try:
-                with self._session().get(url, stream=True, timeout=(10, 60)) as resp:
-                    resp.raise_for_status()
-                    with item.open(rel) as fh:
-                        for chunk in resp.iter_content(CHUNK_BYTES):
-                            if job.stop:
-                                raise _Stopped()
-                            fh.write(chunk)
-                            written += len(chunk)
-                            with self._lock:
-                                job.bytes_done += len(chunk)
-                                self._changed()
+                with source.open_file(remote, self._session()) as chunks, item.open(remote.rel) as fh:
+                    for chunk in chunks:
+                        if job.stop:
+                            raise _Stopped()
+                        fh.write(chunk)
+                        written += len(chunk)
+                        with self._lock:
+                            job.bytes_done += len(chunk)
+                            self._changed()
             except BaseException:
                 with self._lock:
                     job.bytes_done -= written
                 raise
 
-        self._with_retries(job, fetch)
+        self._with_retries(job, source, fetch)
         with self._lock:
             job.files_done += 1
             self._changed()
@@ -461,16 +517,14 @@ _manager_lock = threading.Lock()
 
 
 def _lookup(uids: list[str]) -> dict[str, Series]:
-    from dicom_data_explorer.services import idc_service
-
-    return {uid: Series.from_index(row) for uid, row in idc_service.series_by_uid(uids).items()}
+    return sources.find_series(uids)
 
 
 def get_manager() -> DownloadManager:
     global _manager
     with _manager_lock:
         if _manager is None:
-            _manager = DownloadManager()
+            _manager = DownloadManager(journal_dir=pacs_config.data_dir() / "jobs")
             try:
                 _manager.recover(_lookup)
             except Exception:  # noqa: BLE001 - the queue works without it

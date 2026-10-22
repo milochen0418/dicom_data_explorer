@@ -16,8 +16,11 @@ def _cancel_icon(uid) -> rx.Component:
     )
 
 
-def download_button(uid, wide: bool = False) -> rx.Component:
-    """``uid`` is a series UID var; ``wide`` fills the width (details panel)."""
+def download_button(uid, wide: bool = False, on_download=None) -> rx.Component:
+    """``uid`` is a series UID var; ``wide`` fills the width (details panel).
+
+    ``on_download`` replaces the IDC download (the PACS search queues its own series).
+    """
     width = "w-full py-2" if wide else "w-36 py-1.5"
     status = DownloadState.status_of[uid]
     return rx.match(
@@ -87,7 +90,7 @@ def download_button(uid, wide: bool = False) -> rx.Component:
         rx.el.button(
             rx.icon("download", size=15),
             "Download",
-            on_click=DownloadState.download(uid, False).stop_propagation,
+            on_click=(on_download if on_download is not None else DownloadState.download(uid, False)).stop_propagation,
             class_name=f"{_BASE} {width} text-white bg-blue-600 hover:bg-blue-700 shadow-sm",
         ),
     )
